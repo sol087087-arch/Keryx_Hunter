@@ -1,18 +1,18 @@
 # keryx/core/schemas.py
 """Strict Pydantic schemas for KeryxHunter.
 
-These schemas are used for INPUT VALIDATION only.
+SCOPE: input validation and typed observability only.
 Tool outputs use toolbox.ToolResult (dataclass) so the ToolBox dispatch
 pipeline and agent observation contract remain intact.
+Do NOT add ToolResult here — it lives in keryx.tools.toolbox.
 """
 
 from __future__ import annotations
 
 from enum import Enum
-from typing import Annotated, Any, Literal, Optional
+from typing import Annotated, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
-from pydantic import FieldValidationInfo  # FIX: correct type for v2 validators
 
 
 # ---------------------------------------------------------------------------
@@ -27,7 +27,7 @@ class RiskLevel(str, Enum):
 
 
 # ---------------------------------------------------------------------------
-# Git tool input schema
+# Git tool input
 # ---------------------------------------------------------------------------
 
 class GitBlameInput(BaseModel):
@@ -44,48 +44,45 @@ class GitBlameInput(BaseModel):
     extensions:  Optional[list[str]] = None
     min_changes: int                 = Field(2, ge=1)
 
+    # FIX: @model_validator(mode="after") for cross-field validation.
+    # @field_validator cannot reliably see sibling fields due to evaluation order.
     @model_validator(mode="after")
     def file_required_for_blame(self) -> "GitBlameInput":
-        # FIX: use @model_validator(mode="after") — cleaner than @field_validator
-        # for cross-field validation, and avoids the FieldValidationInfo.data
-        # ordering issue (fields may not be populated yet in field validators).
         if self.command == "blame" and not self.file:
-            raise ValueError("'file' is required for command='blame'")
+            raise ValueError("'file' is required when command='blame'")
         return self
 
 
 # ---------------------------------------------------------------------------
-# Hotspot entry (immutable)
+# Hotspot entry (immutable result record)
 # ---------------------------------------------------------------------------
 
 class HotspotEntry(BaseModel):
-    """A single hotspot file record."""
+    """A single hotspot file record. Frozen so callers cannot mutate scores."""
 
     file:             str
     changes:          int   = Field(..., ge=0)
     authors:          int   = Field(..., ge=0)
     complexity_score: float = Field(..., ge=0.0)
     risk_level:       RiskLevel
-    # FIX: max_length on Field() applies to str, not list.
-    # Use Annotated with a validator for list length enforcement.
-    top_authors: Annotated[list[str], Field(default_factory=list)] = Field(
-        default_factory=list
-    )
+    # FIX: Field(max_length=3) applies to str, not list — silently ignored in Pydantic v2.
+    # Use a validator to enforce the cap.
+    top_authors: list[str] = Field(default_factory=list)
 
     model_config = {"frozen": True}
 
     @field_validator("top_authors", mode="before")
     @classmethod
     def cap_top_authors(cls, v: list[str]) -> list[str]:
-        return v[:3]
+        return list(v)[:3]
 
 
 # ---------------------------------------------------------------------------
-# Metrics snapshot (typed observability — replaces Dict[str, Any])
+# Metrics snapshot
 # ---------------------------------------------------------------------------
 
 class MetricsSnapshot(BaseModel):
-    """Tool metrics for observability."""
+    """Typed tool metrics. Replaces Dict[str, Any] in observability paths."""
 
     name:         str
     calls:        int   = Field(..., ge=0)
