@@ -1,0 +1,396 @@
+# keryx/core/router.py
+# Capability Router for KeryxHunter
+# Decides executor / advisor / budget per task.
+# Sovereign, air-gapped aware, cascade-advisor aware.
+import logging
+import yaml
+from pathlib import Path
+from typing import Dict, Any, Optional, List, TypedDict
+from ..models.interface import ModelInterface
+from ..advisors.manager import AdvisorManager
+logger = logging.getLogger("keryx.router")
+# ---------------------------------------------------------------------------
+# Model capability tiers
+# ---------------------------------------------------------------------------
+class ModelCapability(TypedDict):
+    tier: int
+    is_local: bool
+    context_length: int
+    requires_gpu: bool
+_CAPABILITY_TIERS: Dict[str, ModelCapability] = {
+    "llama-70b": {"tier": 100, "is_local": True, "context_length": 32768, "requires_gpu": True},
+    "qwen-32b": {"tier": 95, "is_local": True, "context_length": 131072, "requires_gpu": True},
+    "deepseek-coder": {"tier": 90, "is_local": False, "context_length": 16384, "requires_gpu": False},
+    "mistral-large": {"tier": 88, "is_local": False, "context_length": 32768, "requires_gpu": False},
+    "codellama-34b": {"tier": 85, "is_local": True, "context_length": 16384, "requires_gpu": True},
+    "llama-13b": {"tier": 50, "is_local": True, "context_length": 8192, "requires_gpu": False},
+    "llama-8b": {"tier": 40, "is_local": True, "context_length": 8192, "requires_gpu": False},
+}
+# FIX 1: lru_cache on instance methods leaks memory.
+# _get_fallback_chain doesn't use self at all — move to module level.
+# This way: one shared cache for all Router instances, no memory leak,
+# and the cache actually works (instance methods get separate caches per self).
+def _build_fallback_chain(model_name: str) -> List[str]:
+    """
+    Return fallback candidates ordered by capability tier (descending),
+    excluding the requested model itself, capped at same tier or below.
+    Module-level so lru_cache doesn't pin Router instances.
+    """
+    requested_tier = _CAPABILITY_TIERS.get(model_name, {}).get("tier", 0)
+    return [
+        name
+        for name, specs in sorted(
+            _CAPABILITY_TIERS.items(), key=lambda x: x[1]["tier"], reverse=True
+        )
+        if name != model_name and specs["tier"] <= requested_tier
+    ]
+# Pre-compute fallback chains for all known models at import time.
+# Cheap to do, eliminates repeated sorting in hot path.
+_FALLBACK_CHAINS: Dict[str, List[str]] = {
+    name: _build_fallback_chain(name) for name in _CAPABILITY_TIERS
+}
+# ---------------------------------------------------------------------------
+# Routing result
+# ---------------------------------------------------------------------------
+class RoutingPlan:
+    """
+    Concrete routing decision for a given capability + environment.
+    Passed to KeryxAgent and AdvisorManager.
+    """
+    def **init**(
+        self,
+        executor_model: ModelInterface,
+        advisor_name: str,
+        advisor_chain: List[str],
+        budget_usd: Optional[float],
+        enforce_no_network: bool,
+        require_consensus: bool,
+        consensus_threshold: float,
+        require_fuzzing_confirm: bool,
+        debate_models: List[str],
+        capability: str,
+    ):
+        self.executor_model = executor_model
+        self.advisor_name = advisor_name
+        self.advisor_chain = advisor_chain
+        self.budget_usd = budget_usd
+        self.enforce_no_network = enforce_no_network
+        self.require_consensus = require_consensus
+        self.consensus_threshold = consensus_threshold
+        self.require_fuzzing_confirm = require_fuzzing_confirm
+        self.debate_models = debate_models
+        self.capability = capability
+        self._validate()
+    def _validate(self) -> None:
+        """
+        Validate routing decisions before the agent starts.
+        FIX 2: **post_init** is a dataclass convention — using it on a plain
+        class is misleading. Renamed to _validate() and called explicitly.
+        FIX 3: cascade advisor check was hardcoded to the string
+        "cascade-advisor". If user names their cascade advisor differently
+        (e.g. "my-cascade"), validation would silently not run.
+        Now we check advisor_chain length regardless of advisor_name.
+        """
+        if self.enforce_no_network and self.budget_usd is not None:
+            raise ValueError(
+                "Air-gapped mode cannot have a budget — local compute has no API cost."
+            )
+        if self.require_consensus and len(self.debate_models) < 2:
+            raise ValueError(
+                f"Consensus requires at least 2 debate models, got {self.debate_models!r}."
+            )
+        # Check chain length for ANY advisor that declares a chain
+        if self.advisor_chain is not None and len(self.advisor_chain) == 1:
+            raise ValueError(
+                f"Advisor chain must have ≥2 entries or be empty, got {self.advisor_chain!r}."
+            )
+    def **repr**(self) -> str:
+        return (
+            f"RoutingPlan(capability={self.capability!r}, "
+            f"executor={self.executor_model.model_name!r}, "
+            f"advisor={self.advisor_name!r}, "
+            f"budget={self.budget_usd}, "
+            f"airgapped={self.enforce_no_network})"
+        )
+# ---------------------------------------------------------------------------
+# Default capability profiles
+# ---------------------------------------------------------------------------
+_DEFAULTS: Dict[str, Dict[str, Any]] = {
+    "fast_pattern_matching": {
+        "executor": "llama-8b",
+        "advisor": "none",
+        "advisor_chain": [],
+        "timeout_seconds": 5,
+        "enforce_no_network": True,
+        "budget_usd": None,
+    },
+    "deep_reasoning": {
+        "executor": "llama-8b",
+        "advisor": "local-advisor",
+        "advisor_chain": [],
+        "fallback_advisor": "cloud-advisor",
+        "timeout_seconds": 120,
+        "self_critique_rounds": 2,
+        "enforce_no_network": False,
+        "budget_usd": 5.0,
+    },
+    "airgapped": {
+        "executor": "llama-8b",
+        "advisor": "firefox-specialist",
+        "advisor_chain": [],
+        "enforce_no_network": True,
+        "debate_models": ["llama-70b", "qwen-32b", "llama-8b"],
+        "budget_usd": None,
+    },
+    "verified_only": {
+        "executor": "llama-70b",
+        "advisor": "cascade-advisor",
+        "advisor_chain": ["local-advisor", "cloud-advisor"],
+        "require_consensus": True,
+        "consensus_threshold": 0.67,
+        "require_fuzzing_confirm": True,
+        "enforce_no_network": False,
+        "budget_usd": 10.0,
+    },
+}
+# Metrics keys as a constant to avoid duplication between **init** and reset.
+_METRIC_KEYS = ("routing_decisions", "fallbacks_used", "health_check_failures", "gpu_skips")
+class CapabilityRouter:
+    """
+    Routes hunt requests to the right executor + advisor combination
+    based on capability profile, system state (air-gapped, budget, GPU),
+    and available models.
+    Usage:
+        router = CapabilityRouter()
+        plan = router.route(
+            capability="deep_reasoning",
+            available_models={"llama-8b": model_instance, ...},
+            advisor_manager=advisor_mgr,
+            is_airgapped=False,
+            user_budget_usd=3.0,
+        )
+    """
+    def **init**(
+        self,
+        config_path: Optional[Path] = None,
+        has_gpu: bool = False, # FIX 4: default False — safe, not assumed
+    ):
+        self.config_path = config_path or Path.home() / ".keryx" / "capabilities.yaml"
+        self.capabilities = self._load_capabilities()
+        self._has_gpu = has_gpu
+        self.metrics: Dict[str, int] = dict.fromkeys(_METRIC_KEYS, 0)
+        logger.info(f"[Router] Loaded {len(self.capabilities)} capability profiles | gpu={has_gpu}")
+    def get_metrics(self) -> Dict[str, int]:
+        return self.metrics.copy()
+    def reset_metrics(self) -> None:
+        self.metrics = dict.fromkeys(_METRIC_KEYS, 0)
+    # ------------------------------------------------------------------
+    # Main public method
+    # ------------------------------------------------------------------
+    def route(
+        self,
+        capability: str,
+        available_models: Dict[str, ModelInterface],
+        advisor_manager: AdvisorManager,
+        is_airgapped: bool = False,
+        user_budget_usd: Optional[float] = None,
+    ) -> RoutingPlan:
+        """
+        Resolve a capability name into a concrete RoutingPlan.
+        Args:
+            capability: Profile name from capabilities.yaml.
+            available_models: Dict of model_name → ModelInterface instances.
+            advisor_manager: Loaded AdvisorManager with registered advisors.
+            is_airgapped: If True, cloud models and advisors are blocked.
+            user_budget_usd: CLI --budget override. Caps profile budget.
+        """
+        self.metrics["routing_decisions"] += 1
+        if capability not in self.capabilities:
+            logger.warning(f"Unknown capability '{capability}' — falling back to 'deep_reasoning'")
+            capability = "deep_reasoning"
+        cfg = self.capabilities[capability].copy()
+        executor = self._resolve_executor(
+            requested=cfg["executor"],
+            available=available_models,
+            is_airgapped=is_airgapped,
+        )
+        # Health check on chosen executor before committing to it
+        if not executor.is_healthy():
+            self.metrics["health_check_failures"] += 1
+            raise RuntimeError(
+                f"Executor '{executor.model_name}' failed health check — "
+                f"check model path and GPU availability."
+            )
+        advisor_name, advisor_chain = self._resolve_advisor(
+            cfg=cfg,
+            advisor_manager=advisor_manager,
+            is_airgapped=is_airgapped,
+        )
+        budget = self._resolve_budget(
+            profile_budget=cfg.get("budget_usd"),
+            user_budget=user_budget_usd,
+            enforce_no_network=cfg.get("enforce_no_network", False),
+        )
+        plan = RoutingPlan(
+            executor_model=executor,
+            advisor_name=advisor_name,
+            advisor_chain=advisor_chain,
+            budget_usd=budget,
+            enforce_no_network=cfg.get("enforce_no_network", False),
+            require_consensus=cfg.get("require_consensus", False),
+            consensus_threshold=cfg.get("consensus_threshold", 0.67),
+            require_fuzzing_confirm=cfg.get("require_fuzzing_confirm", False),
+            debate_models=cfg.get("debate_models", []),
+            capability=capability,
+        )
+        logger.debug(f"Resolved: {plan}")
+        return plan
+    # ------------------------------------------------------------------
+    # Resolution helpers
+    # ------------------------------------------------------------------
+    def _resolve_executor(
+        self,
+        requested: str,
+        available: Dict[str, ModelInterface],
+        is_airgapped: bool,
+    ) -> ModelInterface:
+        """
+        Pick executor. Walk pre-computed fallback chain ordered by capability tier.
+        Filters out GPU-required models when no GPU is present.
+        Filters out non-local models in air-gapped mode.
+        """
+        # Use pre-computed chain; unknown models get an empty chain
+        candidates = [requested] + _FALLBACK_CHAINS.get(requested, [])
+        for name in candidates:
+            if name not in available:
+                continue
+            model = available[name]
+            caps = _CAPABILITY_TIERS.get(name, {})
+            if caps.get("requires_gpu", False) and not self._has_gpu:
+                logger.warning(f"Skipping '{name}' — requires GPU (has_gpu={self._has_gpu})")
+                self.metrics["gpu_skips"] += 1
+                continue
+            if is_airgapped and not caps.get("is_local", False):
+                logger.debug(f"Skipping '{name}' — not local, air-gapped mode active")
+                continue
+            # Double-check against the live model instance as well
+            if is_airgapped and not getattr(model, "is_local", False):
+                logger.debug(f"Skipping '{name}' — model instance reports non-local")
+                continue
+            if name != requested:
+                self.metrics["fallbacks_used"] += 1
+                logger.info(f"Executor fallback: '{requested}' → '{name}'")
+            return model
+        raise RuntimeError(
+            f"No suitable executor found for '{requested}' "
+            f"(air-gapped={is_airgapped}, has_gpu={self._has_gpu}, "
+            f"available={list(available.keys())})"
+        )
+    def _resolve_advisor(
+        self,
+        cfg: Dict[str, Any],
+        advisor_manager: AdvisorManager,
+        is_airgapped: bool,
+    ) -> tuple[str, List[str]]:
+        """
+        Resolve advisor name and chain.
+        Single get_advisor() lookup per name (avoids has_advisor + get_advisor
+        double lookup and any race between them).
+        """
+        requested = cfg.get("advisor", "none")
+        fallback = cfg.get("fallback_advisor")
+        chain = list(cfg.get("advisor_chain", []))
+        if requested == "none":
+            return "none", []
+        def _try(name: Optional[str]) -> Optional[str]:
+            if not name:
+                return None
+            advisor = advisor_manager.get_advisor(name)
+            if advisor is None:
+                logger.debug(f"Advisor '{name}' not registered")
+                return None
+            if is_airgapped and getattr(advisor, "requires_network", False):
+                logger.info(f"Advisor '{name}' requires network — skipping (air-gapped)")
+                return None
+            return name
+        # Primary
+        resolved = _try(requested)
+        if resolved:
+            return resolved, chain
+        # Fallback
+        if fallback:
+            resolved = _try(fallback)
+            if resolved:
+                logger.info(f"Advisor fallback: '{requested}' → '{fallback}'")
+                return resolved, []
+        # Cascade chain (filtered for air-gapped)
+        if chain:
+            if is_airgapped:
+                chain = [
+                    a for a in chain
+                    if not getattr(advisor_manager.get_advisor(a), "requires_network", True)
+                ]
+                logger.info(f"Air-gapped: cascade chain filtered → {chain}")
+            if chain:
+                return chain[0], chain
+        logger.warning(f"No suitable advisor for '{requested}' — running without advisor")
+        return "none", []
+    @staticmethod
+    def _resolve_budget(
+        profile_budget: Optional[float],
+        user_budget: Optional[float],
+        enforce_no_network: bool,
+    ) -> Optional[float]:
+        """
+        Budget resolution:
+        1. Air-gapped → None (local compute, no API billing)
+        2. Both set → min(user, profile) — user can't exceed profile ceiling
+        3. One set → use it
+        4. Neither → None (unlimited)
+        """
+        if enforce_no_network:
+            return None
+        if user_budget is not None and profile_budget is not None:
+            return min(user_budget, profile_budget)
+        return user_budget if user_budget is not None else profile_budget
+    # ------------------------------------------------------------------
+    # Config loading
+    # ------------------------------------------------------------------
+    def _load_capabilities(self) -> Dict[str, Dict[str, Any]]:
+        """Load built-in defaults, then deep-merge user capabilities.yaml."""
+        merged = {k: v.copy() for k, v in _DEFAULTS.items()}
+        if not self.config_path.exists():
+            return merged
+        try:
+            with open(self.config_path) as f:
+                user_cfg = yaml.safe_load(f) or {}
+            user_caps = user_cfg.get("capabilities", {})
+            for name, profile in user_caps.items():
+                if name in merged:
+                    merged[name].update(profile)
+                else:
+                    merged[name] = profile
+            logger.info(f"Merged {len(user_caps)} profiles from {self.config_path}")
+        except Exception as exc:
+            logger.warning(f"Failed to load capabilities.yaml: {exc} — using defaults")
+        return merged
+    # ------------------------------------------------------------------
+    # CLI helpers
+    # ------------------------------------------------------------------
+    def list_capabilities(self) -> List[str]:
+        return sorted(self.capabilities.keys())
+    def describe(self, capability: str) -> str:
+        if capability not in self.capabilities:
+            return f"Unknown capability: {capability!r}"
+        lines = [f"Capability: {capability}"]
+        for k, v in self.capabilities[capability].items():
+            lines.append(f" {k}: {v}")
+        return "\n".join(lines)
+# ---------------------------------------------------------------------------
+# Convenience factory
+# ---------------------------------------------------------------------------
+def create_router(
+    config_path: Optional[Path] = None,
+    has_gpu: bool = False,
+) -> CapabilityRouter:
+    return CapabilityRouter(config_path, has_gpu)
