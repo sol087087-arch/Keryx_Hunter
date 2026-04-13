@@ -1,347 +1,645 @@
-# keryx/models/interface.py
-# Abstract base interface for ALL model backends in KeryxHunter.
-# Local (llama.cpp, MLX, TensorRT) and remote (Anthropic, OpenAI, Groq) share this contract.
-# Sovereign, air-gapped, async-first.
-from **future** import annotations
+# keryx/models/remote.py
+# RemoteModel — cloud LLM backend for KeryxHunter.
+# Implements ModelInterface for Anthropic, OpenAI, Groq, DeepSeek.
+# Production-hardened: tiktoken token counting, privacy scrubbing,
+# async context manager, exponential backoff + Retry-After,
+# precise budget checks BEFORE the call.
+
+from __future__ import annotations
+
+import asyncio
+import json
 import logging
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from enum import Enum, auto
-from typing import (
-    Any, AsyncIterator, Callable, Dict, List, Optional, Union
+import re
+import threading
+import time
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+
+import httpx
+
+try:
+    import tiktoken
+    _TIKTOKEN_AVAILABLE = True
+except ImportError:
+    _TIKTOKEN_AVAILABLE = False
+
+from .interface import (
+    ModelCapabilities,
+    ModelInterface,
+    GenerationConfig,
+    GenerationResult,
+    ToolDefinition,
+    ToolCall,
+    CostEstimate,
+    ModelError,
+    BudgetExceededError,
+    ContextOverflowError,
 )
-# TypedDict is stdlib since 3.8
-from typing import TypedDict
-logger = logging.getLogger("keryx.models")
+
+logger = logging.getLogger("keryx.models.remote")
+
+
 # ---------------------------------------------------------------------------
-# Generation configuration
+# Per-provider context lengths and costs (per 1k tokens)
 # ---------------------------------------------------------------------------
+
+_PROVIDER_MODELS: Dict[str, Dict[str, Any]] = {
+    # Anthropic
+    "claude-opus-4.6":           {"ctx": 200_000, "in": 15.00,  "out": 75.00},
+    "claude-sonnet-4.6":         {"ctx": 200_000, "in":  3.00,  "out": 15.00},
+    "claude-haiku-4.6":          {"ctx": 200_000, "in":  0.80,  "out":  4.00},
+    # OpenAI
+    "gpt-5.4":                    {"ctx": 128_000, "in":  2.50,  "out": 10.00},
+    "gpt-5.4-mini":               {"ctx": 128_000, "in":  0.15,  "out":  0.60},
+    "gpt-5-turbo":               {"ctx": 128_000, "in": 10.00,  "out": 30.00},
+    "o3-mini":                   {"ctx": 200_000, "in":  1.10,  "out":  4.40},
+    # Groq (free tier, approximate)
+    "llama-4-70b-versatile":   {"ctx":  32_768, "in":  0.59,  "out":  0.79},
+    "llama-3.1-8b-instant":      {"ctx": 131_072, "in":  0.05,  "out":  0.08},
+    "mixtral-8x7b-32768":        {"ctx":  32_768, "in":  0.24,  "out":  0.24},
+    # DeepSeek
+    "deepseek-v4":             {"ctx":  64_000, "in":  0.14,  "out":  0.28},
+    "deepseek-r1":            {"ctx":  16_000, "in":  0.14,  "out":  0.28},
+}
+
+_DEFAULT_CTX = 32_768
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
 @dataclass
-class GenerationConfig:
-    """
-    Structured generation parameters — works for both local and cloud models.
-    Fields not supported by a backend are silently ignored.
-    """
-    max_tokens: int = 1000
-    temperature: float = 0.7
-    top_p: float = 0.9
-    min_p: float = 0.05 # effective for local models; reduces repetition
-    top_k: int = 0
-    repeat_penalty: float = 1.1
-    stop: Optional[List[str]] = None
-    grammar: Optional[str] = None # GBNF string for llama.cpp
-    seed: Optional[int] = None
-    # Callable excluded from serialization and comparison
-    logits_post_processor: Optional[Callable] = field(default=None, repr=False, compare=False)
-    def to_dict(self) -> Dict[str, Any]:
-        """Safe serialization — excludes non-serializable Callable."""
-        return {
-            k: v for k, v in self.**dict**.items()
-            if k != "logits_post_processor"
-        }
-    @classmethod
-    def default(cls) -> "GenerationConfig":
-        return cls()
-    @classmethod
-    def for_critique(cls) -> "GenerationConfig":
-        """Short, focused output for self-critique steps."""
-        return cls(max_tokens=350, temperature=0.3, grammar=None)
-    @classmethod
-    def for_structured(cls, grammar: str) -> "GenerationConfig":
-        """Grammar-constrained JSON output."""
-        return cls(max_tokens=1000, temperature=0.1, grammar=grammar)
+class RemoteModelConfig:
+    provider:    str              # anthropic | openai | groq | deepseek
+    api_key:     str
+    model_name:  str
+    base_url:    Optional[str]   = None
+    max_retries: int             = 3
+    timeout:     float           = 60.0
+    max_budget_usd: Optional[float] = None
+
+
 # ---------------------------------------------------------------------------
-# Result types — ONE definition, used everywhere
+# Privacy scrubbing (self-contained)
 # ---------------------------------------------------------------------------
-@dataclass
-class GenerationResult:
-    """
-    Full generation result with metrics.
-    time_to_first_token_ms enables streaming UI progress bars.
-    FIX: previous local.py used GenerationResult with tokens_generated.
-    Canonical field names are tokens_input / tokens_output here.
-    local.py updated to match.
-    """
-    text: str
-    tokens_input: int
-    tokens_output: int
-    duration_ms: float
-    time_to_first_token_ms: float = 0.0
-    finish_reason: str = "stop" # stop | length | tool_call
-    metadata: Dict[str, Any] = field(default_factory=dict)
-    @property
-    def tokens_per_second(self) -> float:
-        return self.tokens_output / (self.duration_ms / 1000) if self.duration_ms > 0 else 0.0
+
+_SCRUB_PATS = [
+    (re.compile(r'/home/[^/\s]+',    re.I), '/workspace'),
+    (re.compile(r'/Users/[^/\s]+',   re.I), '/workspace'),
+    (re.compile(r'C:\\Users\\[^\\\s]+', re.I), 'C:\\workspace'),
+    (re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'), '[EMAIL]'),
+    (re.compile(r'sk-[A-Za-z0-9]{40,}'), '[API_KEY]'),
+    (re.compile(r'AKIA[0-9A-Z]{16}'), '[AWS_KEY]'),
+]
+
+
+def _scrub(text: str) -> str:
+    for pat, repl in _SCRUB_PATS:
+        text = pat.sub(repl, text)
+    return text
+
+
 # ---------------------------------------------------------------------------
-# Tool types — ONE definition
+# RemoteModel
 # ---------------------------------------------------------------------------
-class ToolCall(TypedDict):
-    name: str
-    arguments: Dict[str, Any]
-class ToolDefinition(TypedDict):
-    name: str
-    description: str
-    parameters: Dict[str, Any] # JSON Schema object
+
+class RemoteModel(ModelInterface):
+    """
+    Remote cloud model backend (Anthropic, OpenAI-compatible, Groq, DeepSeek).
+
+    Async-primary: use generate_async() directly from async code.
+    Sync generate() is available for agent.py compatibility but runs
+    the coroutine on a dedicated background thread loop.
+
+    generate_async() accepts (prompt, grammar=None, max_tokens=None) kwargs
+    so agent.py can call it the same way as LocalModel.
+    Grammar is silently ignored — cloud models don't support GBNF.
+    """
+
+    def __init__(self, config: RemoteModelConfig) -> None:
+        self.config     = config
+        self.model_name = config.model_name
+        self.is_local   = False
+
+        spec = _PROVIDER_MODELS.get(config.model_name, {})
+        self.cost_per_1k_input_tokens  = spec.get("in",  0.0)
+        self.cost_per_1k_output_tokens = spec.get("out", 0.0)
+        self._ctx_length               = spec.get("ctx", _DEFAULT_CTX)
+
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(config.timeout, connect=10.0),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+
+        self._session_cost_usd    = 0.0
+        self._total_input_tokens  = 0
+        self._total_output_tokens = 0
+        self._call_count          = 0
+        self._healthy             = True
+
+        self._tokenizer = self._get_tokenizer(config.model_name)
+
+        # Provider routing
+        if config.provider == "anthropic":
+            self._base_url = config.base_url or "https://api.anthropic.com/v1"
+            self._headers  = {
+                "x-api-key":         config.api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type":      "application/json",
+            }
+        else:
+            self._base_url = config.base_url or "https://api.openai.com/v1"
+            self._headers  = {
+                "Authorization": f"Bearer {config.api_key}",
+                "content-type":  "application/json",
+            }
+
+        # Background sync loop (FIX 2)
+        self._sync_loop:   Optional[asyncio.AbstractEventLoop] = None
+        self._sync_thread: Optional[threading.Thread]           = None
+        self._loop_ready   = threading.Event()
+
+        logger.info(
+            f"[RemoteModel] {config.provider}/{config.model_name} | "
+            f"ctx={self._ctx_length:,} | budget=${config.max_budget_usd}"
+        )
+
+    # ------------------------------------------------------------------
+    # Tokeniser
+    # ------------------------------------------------------------------
+
+    def _get_tokenizer(self, model_name: str) -> Any:
+        if not _TIKTOKEN_AVAILABLE:
+            return None
+        try:
+            return tiktoken.encoding_for_model(model_name)
+        except Exception:
+            try:
+                return tiktoken.get_encoding("cl100k_base")
+            except Exception:
+                return None
+
+    def tokenize(self, text: str) -> List[int]:
+        """FIX 6: mandatory abstract method."""
+        if self._tokenizer:
+            return self._tokenizer.encode(text)
+        return list(range(len(text) // 3))   # rough fallback
+
+    def _count_tokens(self, text: str) -> int:
+        return len(self.tokenize(text))
+
+    # ------------------------------------------------------------------
+    # Budget
+    # ------------------------------------------------------------------
+
+    def _check_budget(self, estimated_cost: float = 0.0) -> None:
+        if self.config.max_budget_usd is not None:
+            if self._session_cost_usd + estimated_cost > self.config.max_budget_usd:
+                raise BudgetExceededError(
+                    f"Budget ${self.config.max_budget_usd:.2f} would be exceeded "
+                    f"(used: ${self._session_cost_usd:.4f}, est: ${estimated_cost:.4f})"
+                )
+
+    def _update_cost(self, input_t: int, output_t: int) -> None:
+        cost = (
+            input_t  * self.cost_per_1k_input_tokens  / 1000 +
+            output_t * self.cost_per_1k_output_tokens / 1000
+        )
+        self._session_cost_usd    += cost
+        self._total_input_tokens  += input_t
+        self._total_output_tokens += output_t
+
+    # ------------------------------------------------------------------
+    # Core async generation
+    # FIX 4: accept grammar= and max_tokens= kwargs (ignored/overridden)
+    # ------------------------------------------------------------------
+
+    async def generate_async(
+        self,
+        prompt:     str,
+        config:     Optional[GenerationConfig] = None,
+        *,
+        grammar:    Optional[str] = None,    # GBNF — silently ignored for cloud
+        max_tokens: Optional[int] = None,
+    ) -> str:
+        """
+        FIX 4+5: returns str (not GenerationResult) to match agent.py expectations.
+        grammar is accepted but ignored — cloud APIs don't support GBNF.
+        """
+        cfg = config or GenerationConfig()
+        if max_tokens is not None:
+            cfg = GenerationConfig(
+                max_tokens=max_tokens,
+                temperature=cfg.temperature,
+                top_p=cfg.top_p,
+                stop=cfg.stop,
+            )
+
+        scrubbed = _scrub(prompt)
+        input_tokens = self._count_tokens(scrubbed)
+
+        if input_tokens > self._ctx_length:
+            raise ContextOverflowError(
+                f"Prompt {input_tokens} tokens exceeds context {self._ctx_length}"
+            )
+
+        estimated = (
+            input_tokens * self.cost_per_1k_input_tokens / 1000 +
+            cfg.max_tokens * self.cost_per_1k_output_tokens / 1000
+        )
+        self._check_budget(estimated)
+        self._call_count += 1
+
+        last_error: Optional[Exception] = None
+        for attempt in range(self.config.max_retries + 1):
+            try:
+                if self.config.provider == "anthropic":
+                    payload = self._build_anthropic_payload(scrubbed, cfg)
+                    url     = f"{self._base_url}/messages"
+                else:
+                    payload = self._build_openai_payload(scrubbed, cfg)
+                    url     = f"{self._base_url}/chat/completions"
+
+                response = await self._client.post(url, json=payload, headers=self._headers)
+                response.raise_for_status()
+                data     = response.json()
+                text, in_t, out_t = self._parse_response(data)
+                self._update_cost(in_t, out_t)
+                self._healthy = True
+                return text
+
+            except httpx.HTTPStatusError as exc:
+                last_error = exc
+                status     = exc.response.status_code
+                if status == 429:
+                    wait = float(exc.response.headers.get("Retry-After", 2 ** attempt))
+                    logger.warning(f"[RemoteModel] Rate limited — retry in {wait}s")
+                    await asyncio.sleep(wait)
+                elif status in (500, 502, 503, 504):
+                    await asyncio.sleep(2 ** attempt)
+                else:
+                    raise ModelError(f"HTTP {status}: {exc.response.text[:200]}") from exc
+
+            except (httpx.TimeoutException, httpx.ConnectError) as exc:
+                last_error = exc
+                if attempt < self.config.max_retries:
+                    await asyncio.sleep(2 ** attempt)
+                else:
+                    raise
+
+        self._healthy = False
+        raise ModelError(f"Failed after {self.config.max_retries + 1} attempts: {last_error}")
+
+    # ------------------------------------------------------------------
+    # Sync generate — FIX 2: dedicated background loop (no asyncio.run)
+    # FIX 5: returns str
+    # ------------------------------------------------------------------
+
+    def _ensure_sync_loop(self) -> asyncio.AbstractEventLoop:
+        if self._sync_loop and not self._sync_loop.is_closed():
+            return self._sync_loop
+        self._loop_ready.clear()
+        loop = asyncio.new_event_loop()
+        self._sync_loop = loop
+
+        def _run() -> None:
+            asyncio.set_event_loop(loop)
+            self._loop_ready.set()
+            loop.run_forever()
+
+        self._sync_thread = threading.Thread(target=_run, daemon=True, name="remote-loop")
+        self._sync_thread.start()
+        self._loop_ready.wait(timeout=3.0)
+        return loop
+
+    def generate(
+        self,
+        prompt:     str,
+        config:     Optional[GenerationConfig] = None,
+        *,
+        grammar:    Optional[str] = None,
+        max_tokens: Optional[int] = None,
+    ) -> str:
+        """Sync wrapper — safe from any thread context."""
+        loop   = self._ensure_sync_loop()
+        future = asyncio.run_coroutine_threadsafe(
+            self.generate_async(prompt, config, grammar=grammar, max_tokens=max_tokens),
+            loop,
+        )
+        return future.result(timeout=self.config.timeout + 10.0)
+
+    def generate_result(
+        self,
+        prompt: str,
+        config: Optional[GenerationConfig] = None,
+    ) -> GenerationResult:
+        """Returns full GenerationResult with token counts for budget tracking."""
+        start = time.time()
+        text  = self.generate(prompt, config)
+        return GenerationResult(
+            text=text,
+            tokens_input=self._count_tokens(prompt),
+            tokens_output=self._count_tokens(text),
+            duration_ms=(time.time() - start) * 1000,
+        )
+
+    def generate_stream(
+        self,
+        prompt: str,
+        config: Optional[GenerationConfig] = None,
+    ) -> Iterator[str]:
+        """Sync streaming — yields full response as single chunk (no true streaming for remote)."""
+        yield self.generate(prompt, config)
+
+    # ------------------------------------------------------------------
+    # Tool calling — FIX 3: Anthropic branch added
+    # ------------------------------------------------------------------
+
+    async def generate_with_tools(
+        self,
+        prompt: str,
+        tools:  List[ToolDefinition],
+        config: Optional[GenerationConfig] = None,
+    ) -> Union[str, ToolCall]:
+        cfg      = config or GenerationConfig()
+        scrubbed = _scrub(prompt)
+        self._check_budget()
+
+        if self.config.provider == "anthropic":
+            return await self._generate_with_tools_anthropic(scrubbed, tools, cfg)
+        return await self._generate_with_tools_openai(scrubbed, tools, cfg)
+
+    async def _generate_with_tools_anthropic(
+        self,
+        prompt: str,
+        tools:  List[ToolDefinition],
+        cfg:    GenerationConfig,
+    ) -> Union[str, ToolCall]:
+        anth_tools = [
+            {
+                "name":        t["name"],
+                "description": t["description"],
+                "input_schema": t["parameters"],
+            }
+            for t in tools
+        ]
+        payload = {
+            "model":      self.model_name,
+            "max_tokens": cfg.max_tokens,
+            "temperature": cfg.temperature,
+            "tools":      anth_tools,
+            "messages":   [{"role": "user", "content": prompt}],
+        }
+        response = await self._client.post(
+            f"{self._base_url}/messages", json=payload, headers=self._headers
+        )
+        response.raise_for_status()
+        data = response.json()
+        self._update_cost(
+            data["usage"]["input_tokens"],
+            data["usage"]["output_tokens"],
+        )
+        for block in data.get("content", []):
+            if block.get("type") == "tool_use":
+                return ToolCall(name=block["name"], arguments=block.get("input", {}))
+        text = next(
+            (b["text"] for b in data.get("content", []) if b.get("type") == "text"), ""
+        )
+        return text
+
+    async def _generate_with_tools_openai(
+        self,
+        prompt: str,
+        tools:  List[ToolDefinition],
+        cfg:    GenerationConfig,
+    ) -> Union[str, ToolCall]:
+        payload = {
+            "model":       self.model_name,
+            "max_tokens":  cfg.max_tokens,
+            "temperature": cfg.temperature,
+            "messages":    [{"role": "user", "content": prompt}],
+            "tools":       tools,
+            "tool_choice": "auto",
+        }
+        response = await self._client.post(
+            f"{self._base_url}/chat/completions", json=payload, headers=self._headers
+        )
+        response.raise_for_status()
+        data    = response.json()
+        usage   = data.get("usage", {})
+        self._update_cost(
+            usage.get("prompt_tokens", 0),
+            usage.get("completion_tokens", 0),
+        )
+        message = data["choices"][0]["message"]
+        if message.get("tool_calls"):
+            tc = message["tool_calls"][0]
+            return ToolCall(
+                name=tc["function"]["name"],
+                arguments=json.loads(tc["function"]["arguments"]),
+            )
+        return message.get("content") or ""
+
+    # ------------------------------------------------------------------
+    # Payload builders
+    # ------------------------------------------------------------------
+
+    def _build_anthropic_payload(self, prompt: str, cfg: GenerationConfig) -> Dict:
+        return {
+            "model":       self.model_name,
+            "max_tokens":  cfg.max_tokens,
+            "temperature": cfg.temperature,
+            "messages":    [{"role": "user", "content": prompt}],
+        }
+
+    def _build_openai_payload(self, prompt: str, cfg: GenerationConfig) -> Dict:
+        return {
+            "model":       self.model_name,
+            "max_tokens":  cfg.max_tokens,
+            "temperature": cfg.temperature,
+            "messages":    [{"role": "user", "content": prompt}],
+        }
+
+    def _parse_response(self, data: Dict) -> Tuple[str, int, int]:
+        if self.config.provider == "anthropic":
+            text    = data["content"][0]["text"]
+            input_t = data["usage"]["input_tokens"]
+            output_t = data["usage"]["output_tokens"]
+        else:
+            text    = data["choices"][0]["message"].get("content") or ""
+            input_t = data["usage"]["prompt_tokens"]
+            output_t = data["usage"]["completion_tokens"]
+        return text, input_t, output_t
+
+    # ------------------------------------------------------------------
+    # ModelInterface abstract methods — FIX 6,7,8,9
+    # ------------------------------------------------------------------
+
+    def get_context_length(self) -> int:
+        return self._ctx_length
+
+    def get_capabilities(self) -> ModelCapabilities:
+        return ModelCapabilities(
+            max_context_length=self._ctx_length,
+            supports_tool_calling=True,
+            supports_grammar=False,       # cloud APIs don't support GBNF
+            supports_batching=False,
+            supports_streaming=False,     # not implemented
+            supports_speculative=False,
+            supports_min_p=False,
+            requires_gpu=False,
+            is_local=False,
+            is_quantized=False,
+        )
+
+    def estimate_cost(self, input_tokens: int, output_tokens: int) -> CostEstimate:
+        in_cost  = input_tokens  * self.cost_per_1k_input_tokens  / 1000
+        out_cost = output_tokens * self.cost_per_1k_output_tokens / 1000
+        return CostEstimate(
+            input_cost_usd=in_cost,
+            output_cost_usd=out_cost,
+            total_cost_usd=in_cost + out_cost,
+        )
+
+    def get_usage_cost(self) -> CostEstimate:
+        return CostEstimate(
+            input_cost_usd=self._total_input_tokens  * self.cost_per_1k_input_tokens  / 1000,
+            output_cost_usd=self._total_output_tokens * self.cost_per_1k_output_tokens / 1000,
+            total_cost_usd=self._session_cost_usd,
+        )
+
+    def reset_cost_tracking(self) -> None:
+        self._session_cost_usd    = 0.0
+        self._total_input_tokens  = 0
+        self._total_output_tokens = 0
+
+    def is_healthy(self) -> bool:
+        return self._healthy
+
+    # ------------------------------------------------------------------
+    # Metrics and lifecycle
+    # ------------------------------------------------------------------
+
+    def get_metrics(self) -> Dict[str, Any]:
+        return {
+            "provider":         self.config.provider,
+            "model":            self.model_name,
+            "calls":            self._call_count,
+            "input_tokens":     self._total_input_tokens,
+            "output_tokens":    self._total_output_tokens,
+            "session_cost_usd": round(self._session_cost_usd, 6),
+            "budget_limit_usd": self.config.max_budget_usd,
+            "healthy":          self._healthy,
+        }
+
+    async def load(self) -> None:
+        pass
+
+    def unload(self) -> None:
+        """Close async HTTP client via sync wrapper."""
+        if self._sync_loop and not self._sync_loop.is_closed():
+            future = asyncio.run_coroutine_threadsafe(
+                self._client.aclose(), self._sync_loop
+            )
+            try:
+                future.result(timeout=5.0)
+            except Exception:
+                pass
+        if self._sync_loop and not self._sync_loop.is_closed():
+            self._sync_loop.call_soon_threadsafe(self._sync_loop.stop)
+
+    @asynccontextmanager
+    async def session(self):
+        try:
+            yield self
+        finally:
+            await self._client.aclose()
+
+    def __repr__(self) -> str:
+        return (
+            f"RemoteModel(provider={self.config.provider!r}, "
+            f"model={self.model_name!r}, "
+            f"cost=${self._session_cost_usd:.4f})"
+        )
+
+
 # ---------------------------------------------------------------------------
-# Cost types
+# Factories — FIX 10: cost table uses direct per-1k values, no double division
+# FIX 11: updated model names
 # ---------------------------------------------------------------------------
-class CostEstimate(TypedDict):
-    input_cost_usd: float
-    output_cost_usd: float
-    total_cost_usd: float
-# ---------------------------------------------------------------------------
-# Capability descriptor — single source of truth for router
-# ---------------------------------------------------------------------------
-class ModelCapabilities(TypedDict):
-    max_context_length: int
-    supports_tool_calling: bool
-    supports_grammar: bool # GBNF / constrained decoding
-    supports_batching: bool
-    supports_streaming: bool
-    supports_speculative: bool # speculative decoding with draft model
-    supports_min_p: bool
-    requires_gpu: bool
-    is_local: bool # False = requires network (cloud API)
-    is_quantized: bool
-# ---------------------------------------------------------------------------
-# Abstract interface
-# ---------------------------------------------------------------------------
-class ModelInterface(ABC):
-    """
-    The single contract for every model backend in KeryxHunter.
-    Design decisions:
-    - generate() is SYNC. Callers that need async wrap it in run_in_executor.
-      Reason: llama-cpp-python is a C extension — wrapping with async def
-      create_task() does nothing; the GIL blocks anyway. Be honest about this.
-    - generate_stream() is a SYNC Iterator. Async streaming is handled by
-      generate_stream_async() which uses Queue + call_soon_threadsafe.
-    - Tools are passed AT CALL TIME, not registered on the model.
-      Models are stateless; tool state lives in the agent/toolbox.
-    - tokenize() is mandatory — agents need exact counts before sending.
-    - get_capabilities() is the single source of truth for the router.
-    """
-    # ------------------------------------------------------------------
-    # Identity — as a plain attribute, not abstract property.
-    # Abstract property conflicts with setting self.model_name in **init**.
-    # Subclasses set: self.model_name = "llama-70b"
-    # ------------------------------------------------------------------
-    model_name: str # must be set in **init** of every subclass
-    # ------------------------------------------------------------------
-    # Sync generation (primary path)
-    # ------------------------------------------------------------------
-    @abstractmethod
-    def generate(
-        self,
-        prompt: str,
-        config: Optional[GenerationConfig] = None,
-        *,
-        grammar: Optional[str] = None, # convenience override
-        max_tokens: Optional[int] = None, # convenience override
-    ) -> str:
-        """
-        Synchronous generation. Returns plain text.
-        Convenience kwargs (grammar, max_tokens) override config fields
-        so callers don't need to build a full GenerationConfig for simple calls.
-        This matches how agent.py and orchestrator.py call the model.
-        """
-    @abstractmethod
-    def generate_result(
-        self,
-        prompt: str,
-        config: Optional[GenerationConfig] = None,
-    ) -> GenerationResult:
-        """
-        Synchronous generation with full metrics.
-        Use when you need token counts for budget tracking.
-        """
-    # ------------------------------------------------------------------
-    # Streaming (sync iterator — see local.py generate_stream_async for async)
-    # ------------------------------------------------------------------
-    @abstractmethod
-    def generate_stream(
-        self,
-        prompt: str,
-        config: Optional[GenerationConfig] = None,
-    ) -> "Iterator[str]":
-        """
-        Sync streaming iterator.
-        FIX: 'async def ... -> AsyncIterator' is ambiguous and wrong.
-        A sync Iterator is the correct return type for a C-backed model.
-        For async streaming, use generate_stream_async() in the concrete class.
-        """
-    # ------------------------------------------------------------------
-    # Tool calling
-    # ------------------------------------------------------------------
-    @abstractmethod
-    def generate_with_tools(
-        self,
-        prompt: str,
-        tools: List[ToolDefinition],
-        config: Optional[GenerationConfig] = None,
-    ) -> Union[str, ToolCall]:
-        """
-        Generate with tool calling. Model decides: text or tool invocation.
-        Tools are passed here, not stored on the model.
-        Returns str for text response, ToolCall for tool invocation.
-        """
-    # ------------------------------------------------------------------
-    # Async wrappers (default impl — concrete classes may override)
-    # ------------------------------------------------------------------
-    async def generate_async(
-        self,
-        prompt: str,
-        config: Optional[GenerationConfig] = None,
-        *,
-        grammar: Optional[str] = None,
-        max_tokens: Optional[int] = None,
-    ) -> str:
-        """Async wrapper around sync generate(). Override for true async backends."""
-        import asyncio
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None,
-            lambda: self.generate(prompt, config, grammar=grammar, max_tokens=max_tokens),
-        )
-    # ------------------------------------------------------------------
-    # Context management
-    # ------------------------------------------------------------------
-    @abstractmethod
-    def tokenize(self, text: str) -> List[int]:
-        """
-        Native tokenization — mandatory.
-        Agents call this BEFORE sending to ensure prompt fits in context window.
-        """
-    def count_tokens(self, text: str) -> int:
-        """Convenience: just the count."""
-        return len(self.tokenize(text))
-    @abstractmethod
-    def get_context_length(self) -> int:
-        """Maximum context window in tokens."""
-    def get_context_used(self) -> int:
-        """Current tokens in KV cache. 0 if not tracked."""
-        return 0
-    def get_context_remaining(self) -> int:
-        return self.get_context_length() - self.get_context_used()
-    def clear_context(self, keep_tokens: int = 0) -> None:
-        """
-        Clear KV cache.
-        keep_tokens: preserve this many tokens at start (system prompt prefix).
-        """
-    # ------------------------------------------------------------------
-    # Health — required by router.py
-    # ------------------------------------------------------------------
-    @abstractmethod
-    def is_healthy(self) -> bool:
-        """
-        Lightweight check that the model is loaded and responsive.
-        Called by CapabilityRouter before committing to a routing plan.
-        Should be cheap: tokenize a short string, not a full generation.
-        """
-    # ------------------------------------------------------------------
-    # Cost — required by BudgetController in agent.py
-    # ------------------------------------------------------------------
-    # These two attributes must be set in **init** of every subclass.
-    # BudgetController accesses them via getattr(model, "cost_per_1k_input_tokens", 0.0).
-    cost_per_1k_input_tokens: float # 0.0 for local models
-    cost_per_1k_output_tokens: float # 0.0 for local models
-    @abstractmethod
-    def estimate_cost(self, input_tokens: int, output_tokens: int) -> CostEstimate:
-        """Estimate cost for a call before making it."""
-    @abstractmethod
-    def get_usage_cost(self) -> CostEstimate:
-        """Total accumulated cost since last reset_cost_tracking()."""
-    def reset_cost_tracking(self) -> None:
-        """Reset accumulated cost counters."""
-    # ------------------------------------------------------------------
-    # Capabilities — single source of truth for router
-    # ------------------------------------------------------------------
-    @abstractmethod
-    def get_capabilities(self) -> ModelCapabilities:
-        """
-        Everything the router needs to make routing decisions.
-        Called once at routing time and cached by the router.
-        """
-    @property
-    def capabilities(self) -> ModelCapabilities:
-        return self.get_capabilities()
-    # Convenience shorthands derived from capabilities
-    @property
-    def is_local(self) -> bool:
-        return self.capabilities.get("is_local", True)
-    @property
-    def requires_network(self) -> bool:
-        return not self.is_local
-    @property
-    def requires_gpu(self) -> bool:
-        return self.capabilities.get("requires_gpu", False)
-    @property
-    def supports_grammar(self) -> bool:
-        return self.capabilities.get("supports_grammar", False)
-    @property
-    def supports_speculative(self) -> bool:
-        return self.capabilities.get("supports_speculative", False)
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-    async def load(self) -> None:
-        """
-        Async model loading — for backends where loading is I/O bound
-        (downloading weights, waiting for GPU memory allocation).
-        Default: no-op (most local models load in **init**).
-        """
-    @abstractmethod
-    def unload(self) -> None:
-        """Release all resources: GPU memory, file handles, etc."""
-    async def warmup(self, prompt: str = "ping") -> None:
-        """
-        Async warmup — run a trivial generation to prime KV cache and GPU.
-        Default impl calls generate_async with minimal config.
-        """
-        try:
-            await self.generate_async(prompt, max_tokens=1)
-        except Exception as exc:
-            logger.debug(f"[{self.**class**.**name**}] Warmup skipped: {exc}")
-    # ------------------------------------------------------------------
-    # Observability
-    # ------------------------------------------------------------------
-    def get_metrics(self) -> Dict[str, Any]:
-        """Generation metrics: total calls, tokens, latency, errors."""
-        return {}
-    def get_memory_usage(self) -> Dict[str, float]:
-        """RAM and GPU memory in GB."""
-        return {}
-    def get_version_info(self) -> Dict[str, str]:
-        return {
-            "backend": self.**class**.**name**,
-            "model_name": getattr(self, "model_name", "unknown"),
-        }
-    # ------------------------------------------------------------------
-    # String representation
-    # ------------------------------------------------------------------
-    def **repr**(self) -> str:
-        caps = self.get_capabilities()
-        return (
-            f"{self.**class**.**name**}("
-            f"name={getattr(self, 'model_name', '?')!r}, "
-            f"local={caps.get('is_local')}, "
-            f"ctx={caps.get('max_context_length')})"
-        )
-# ---------------------------------------------------------------------------
-# Exceptions — full hierarchy
-# ---------------------------------------------------------------------------
-class ModelError(Exception):
-    """Base for all model errors."""
-class ModelLoadError(ModelError):
-    """Failed to load model weights or initialize backend."""
-class GenerationError(ModelError):
-    """Generation failed (OOM, timeout, grammar violation, etc.)."""
-class BudgetExceededError(ModelError):
-    """Cloud API budget limit reached."""
-class ContextOverflowError(ModelError):
-    """Prompt exceeds model context window."""
-class ToolCallError(ModelError):
-    """Model returned malformed tool call."""
-# ---------------------------------------------------------------------------
-# Type alias for convenience imports
-# ---------------------------------------------------------------------------
-from typing import Iterator # noqa: E402 — needed for generate_stream signature
+
+def create_anthropic_model(
+    api_key:        str,
+    model:          str            = "claude-sonnet-4.6",
+    max_budget_usd: Optional[float] = None,
+) -> RemoteModel:
+    spec = _PROVIDER_MODELS.get(model, {"ctx": 200_000, "in": 3.0, "out": 15.0})
+    cfg  = RemoteModelConfig(
+        provider="anthropic",
+        api_key=api_key,
+        model_name=model,
+        max_budget_usd=max_budget_usd,
+    )
+    m = RemoteModel(cfg)
+    m.cost_per_1k_input_tokens  = spec["in"]
+    m.cost_per_1k_output_tokens = spec["out"]
+    return m
+
+
+def create_openai_model(
+    api_key:        str,
+    model:          str            = "gpt-5.4",
+    max_budget_usd: Optional[float] = None,
+) -> RemoteModel:
+    spec = _PROVIDER_MODELS.get(model, {"ctx": 128_000, "in": 2.5, "out": 10.0})
+    cfg  = RemoteModelConfig(
+        provider="openai",
+        api_key=api_key,
+        model_name=model,
+        max_budget_usd=max_budget_usd,
+    )
+    m = RemoteModel(cfg)
+    m.cost_per_1k_input_tokens  = spec["in"]
+    m.cost_per_1k_output_tokens = spec["out"]
+    return m
+
+
+def create_groq_model(
+    api_key:        str,
+    model:          str            = "llama-4-70b-versatile",
+    max_budget_usd: Optional[float] = None,
+) -> RemoteModel:
+    spec = _PROVIDER_MODELS.get(model, {"ctx": 32_768, "in": 0.59, "out": 0.79})
+    cfg  = RemoteModelConfig(
+        provider="groq",
+        api_key=api_key,
+        model_name=model,
+        base_url="https://api.groq.com/openai/v1",
+        max_budget_usd=max_budget_usd,
+    )
+    m = RemoteModel(cfg)
+    m.cost_per_1k_input_tokens  = spec["in"]
+    m.cost_per_1k_output_tokens = spec["out"]
+    return m
+
+
+def create_deepseek_model(
+    api_key:        str,
+    model:          str            = "deepseek-v4",
+    max_budget_usd: Optional[float] = None,
+) -> RemoteModel:
+    spec = _PROVIDER_MODELS.get(model, {"ctx": 64_000, "in": 0.14, "out": 0.28})
+    cfg  = RemoteModelConfig(
+        provider="deepseek",
+        api_key=api_key,
+        model_name=model,
+        base_url="https://api.deepseek.com/v1",
+        max_budget_usd=max_budget_usd,
+    )
+    m = RemoteModel(cfg)
+    m.cost_per_1k_input_tokens  = spec["in"]
+    m.cost_per_1k_output_tokens = spec["out"]
+    return m

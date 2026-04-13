@@ -47,21 +47,21 @@ logger = logging.getLogger("keryx.models.remote")
 
 _PROVIDER_MODELS: Dict[str, Dict[str, Any]] = {
     # Anthropic
-    "claude-opus-4-5":           {"ctx": 200_000, "in": 15.00,  "out": 75.00},
-    "claude-sonnet-4-5":         {"ctx": 200_000, "in":  3.00,  "out": 15.00},
-    "claude-haiku-4-5":          {"ctx": 200_000, "in":  0.80,  "out":  4.00},
+    "claude-opus-4.6":           {"ctx": 200_000, "in": 15.00,  "out": 75.00},
+    "claude-sonnet-4.6":         {"ctx": 200_000, "in":  3.00,  "out": 15.00},
+    "claude-haiku-4.6":          {"ctx": 200_000, "in":  0.80,  "out":  4.00},
     # OpenAI
-    "gpt-4o":                    {"ctx": 128_000, "in":  2.50,  "out": 10.00},
-    "gpt-4o-mini":               {"ctx": 128_000, "in":  0.15,  "out":  0.60},
-    "gpt-4-turbo":               {"ctx": 128_000, "in": 10.00,  "out": 30.00},
+    "gpt-5.4":                    {"ctx": 128_000, "in":  2.50,  "out": 10.00},
+    "gpt-5.4-mini":               {"ctx": 128_000, "in":  0.15,  "out":  0.60},
+    "gpt-5-turbo":               {"ctx": 128_000, "in": 10.00,  "out": 30.00},
     "o3-mini":                   {"ctx": 200_000, "in":  1.10,  "out":  4.40},
     # Groq (free tier, approximate)
-    "llama-3.3-70b-versatile":   {"ctx":  32_768, "in":  0.59,  "out":  0.79},
+    "llama-4-70b-versatile":   {"ctx":  32_768, "in":  0.59,  "out":  0.79},
     "llama-3.1-8b-instant":      {"ctx": 131_072, "in":  0.05,  "out":  0.08},
     "mixtral-8x7b-32768":        {"ctx":  32_768, "in":  0.24,  "out":  0.24},
     # DeepSeek
-    "deepseek-chat":             {"ctx":  64_000, "in":  0.14,  "out":  0.28},
-    "deepseek-coder":            {"ctx":  16_000, "in":  0.14,  "out":  0.28},
+    "deepseek-v4":             {"ctx":  64_000, "in":  0.14,  "out":  0.28},
+    "deepseek-r1":            {"ctx":  16_000, "in":  0.14,  "out":  0.28},
 }
 
 _DEFAULT_CTX = 32_768
@@ -573,7 +573,7 @@ class RemoteModel(ModelInterface):
 
 def create_anthropic_model(
     api_key:        str,
-    model:          str            = "claude-sonnet-4-5",
+    model:          str            = "claude-sonnet-4.6",
     max_budget_usd: Optional[float] = None,
 ) -> RemoteModel:
     spec = _PROVIDER_MODELS.get(model, {"ctx": 200_000, "in": 3.0, "out": 15.0})
@@ -591,7 +591,7 @@ def create_anthropic_model(
 
 def create_openai_model(
     api_key:        str,
-    model:          str            = "gpt-4o",
+    model:          str            = "gpt-5.4",
     max_budget_usd: Optional[float] = None,
 ) -> RemoteModel:
     spec = _PROVIDER_MODELS.get(model, {"ctx": 128_000, "in": 2.5, "out": 10.0})
@@ -609,7 +609,7 @@ def create_openai_model(
 
 def create_groq_model(
     api_key:        str,
-    model:          str            = "llama-3.3-70b-versatile",
+    model:          str            = "llama-4-70b-versatile",
     max_budget_usd: Optional[float] = None,
 ) -> RemoteModel:
     spec = _PROVIDER_MODELS.get(model, {"ctx": 32_768, "in": 0.59, "out": 0.79})
@@ -628,7 +628,7 @@ def create_groq_model(
 
 def create_deepseek_model(
     api_key:        str,
-    model:          str            = "deepseek-chat",
+    model:          str            = "deepseek-v4",
     max_budget_usd: Optional[float] = None,
 ) -> RemoteModel:
     spec = _PROVIDER_MODELS.get(model, {"ctx": 64_000, "in": 0.14, "out": 0.28})

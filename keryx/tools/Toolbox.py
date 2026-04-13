@@ -459,3 +459,34 @@ def create_toolbox(
     if tools:
         tb.register_many(tools)
     return tb
+# ---------------------------------------------------------------------------
+# Default toolbox factory — именно её ждёт агент
+# ---------------------------------------------------------------------------
+
+def create_default_toolbox(
+    allowed_root: Optional[str] = None,
+    default_timeout: float = 60.0,
+) -> ToolBox:
+    """
+    Создаёт Toolbox со всеми инструментами, которые должны быть доступны агенту.
+    Это точка сборки, которую использует orchestrator и agent.
+    """
+    from .read_file import create_read_file_tool
+    from .git_blame import create_git_blame_tool
+    # from .codeql import create_codeql_tool      # раскомментировать позже
+    # from .gdb import create_gdb_tool
+    # from .fuzzer import create_fuzzer_tool
+
+    toolbox = ToolBox(default_timeout=default_timeout)
+
+    # Критический минимум (без него агент падает на первом шаге)
+    toolbox.register(create_read_file_tool(allowed_root=allowed_root))
+    toolbox.register(create_git_blame_tool())
+
+    # Остальные инструменты — добавляем по мере готовности
+    # toolbox.register(create_codeql_tool())
+    # toolbox.register(create_gdb_tool())
+    # toolbox.register(create_fuzzer_tool())
+
+    logger.info(f"[ToolBox] Default toolbox created with {len(toolbox.list_tools())} tools")
+    return toolbox
