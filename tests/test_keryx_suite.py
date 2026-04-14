@@ -6021,7 +6021,7 @@ class TestOrchestratorSignalHandlers:
 
         mock_mem = MagicMock()
         mock_mem.available = 100 * 1024 * 1024  # 100 MB
-        with patch("keryx.core.orchestrator.psutil.virtual_memory", return_value=mock_mem):
+        with patch("keryx.core._escalation.psutil.virtual_memory", return_value=mock_mem):
             result = await orchestrator._check_resources()
         assert result is False
 
@@ -6030,7 +6030,7 @@ class TestOrchestratorSignalHandlers:
         from unittest.mock import patch
 
         with patch(
-            "keryx.core.orchestrator.psutil.virtual_memory",
+            "keryx.core._escalation.psutil.virtual_memory",
             side_effect=Exception("no psutil"),
         ):
             result = await orchestrator._check_resources()
@@ -6285,7 +6285,7 @@ class TestOrchestratorSwarmExtra:
 
         base = {"hypotheses": ["use-after-free in parse()"], "confirmed_vulns": []}
         with patch.object(orchestrator, "_analyze_with_model", side_effect=_slow_analyze), \
-             patch("keryx.core.orchestrator._SWARM_TIMEOUT", 0.05):
+             patch("keryx.core._swarm._SWARM_TIMEOUT", 0.05):
             result = await orchestrator._run_swarm_debate(base, ["yes_model"])
         assert result["swarm_mode"] is True
 
