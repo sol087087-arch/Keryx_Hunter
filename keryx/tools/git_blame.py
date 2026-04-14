@@ -309,7 +309,7 @@ class GitBlameTool(BaseTool):
 
             # ── Step 3: fetch authors for top-15 candidates ────────────────
             candidates = sorted(churn.items(), key=lambda kv: kv[1], reverse=True)[:15]
-            authors_by_file: dict[str, set] = {}
+            authors_by_file: dict[str, set[str]] = {}
 
             for filepath, changes in candidates:
                 if changes < min_churn:
@@ -327,7 +327,7 @@ class GitBlameTool(BaseTool):
                     }
 
             # ── Step 4: score and classify ─────────────────────────────────
-            hotspots = []
+            hotspots: list[dict[str, Any]] = []
             for filepath, changes in churn.items():
                 if changes < min_churn:
                     continue
@@ -511,7 +511,7 @@ class GitBlameTool(BaseTool):
 # ---------------------------------------------------------------------------
 
 def _extract_blame_authors(output: str) -> list[str]:
-    seen: set = set()
+    seen: set[str] = set()
     for line in output.splitlines():
         if line.startswith("author "):
             name = line[7:].strip()
@@ -521,7 +521,7 @@ def _extract_blame_authors(output: str) -> list[str]:
 
 
 def _extract_log_authors(output: str) -> list[str]:
-    seen: set = set()
+    seen: set[str] = set()
     for line in output.splitlines():
         parts = line.split("|")
         if len(parts) >= 2:

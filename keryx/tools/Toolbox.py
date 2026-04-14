@@ -11,7 +11,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 logger = logging.getLogger("keryx.tools")
 
@@ -378,7 +378,7 @@ class ToolBox:
 
     async def execute_batch(
         self,
-        actions:        list[tuple],
+        actions:        list[tuple[str, dict[str, Any]]],
         context:        Any          = None,
         max_concurrent: int          = 4,
     ) -> list[ToolResult]:
@@ -389,7 +389,7 @@ class ToolBox:
         """
         semaphore = asyncio.Semaphore(max_concurrent)
 
-        async def run(action: str, action_input: dict) -> ToolResult:
+        async def run(action: str, action_input: dict[str, Any]) -> ToolResult:
             async with semaphore:
                 return await self.execute_async(action, action_input, context)
 
@@ -408,7 +408,7 @@ class ToolBox:
                     metadata={"action": actions[i][0], "exception": type(r).__name__},
                 ))
             else:
-                out.append(r)
+                out.append(cast(ToolResult, r))
         return out
 
     # ------------------------------------------------------------------

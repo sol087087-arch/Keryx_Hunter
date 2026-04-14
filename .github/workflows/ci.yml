@@ -61,5 +61,12 @@ jobs:
             keryx/core/orchestrator.py \
             keryx/core/router.py \
             keryx/core/agent.py \
+            keryx/core/_airgap.py \
+            keryx/core/_checkpoint.py \
+            keryx/core/_escalation.py \
+            keryx/core/_swarm.py \
             keryx/advisors/base.py \
-            keryx/advisors/manager.py
+            keryx/advisors/manager.py \
+            keryx/tools/Toolbox.py \
+            keryx/tools/read_file.py \
+            keryx/tools/git_blame.py

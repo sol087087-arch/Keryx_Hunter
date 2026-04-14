@@ -168,7 +168,7 @@ class ReadFileTool(BaseTool):
         with open(path, encoding=encoding, errors="replace") as f:
             return f.read(read_limit)
 
-    def get_command(self, action_input: dict[str, Any]) -> list | None:
+    def get_command(self, action_input: dict[str, Any]) -> list[str] | None:
         """No subprocess command — pure Python tool."""
         return None
 
