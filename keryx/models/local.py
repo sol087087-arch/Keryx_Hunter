@@ -9,19 +9,22 @@ import gc
 import json
 import logging
 import time
+from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 from threading import Lock
-from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional, Union
+from typing import Any
 
 import psutil
 from llama_cpp import Llama, LlamaGrammar
 
 from .interface import (
-    ModelInterface,
-    GenerationConfig,
-    GenerationResult as InterfaceGenerationResult,
     CostEstimate,
+    GenerationConfig,
     ModelCapabilities,
+    ModelInterface,
+)
+from .interface import (
+    GenerationResult as InterfaceGenerationResult,
 )
 
 logger = logging.getLogger("keryx.models.local")
@@ -51,7 +54,7 @@ class GenerationResult:
 class ToolCall:
     __slots__ = ("name", "arguments")
 
-    def __init__(self, name: str, arguments: Dict[str, Any]):
+    def __init__(self, name: str, arguments: dict[str, Any]):
         self.name = name
         self.arguments = arguments
 
@@ -63,8 +66,8 @@ class ToolDefinition:
         self,
         name: str,
         description: str,
-        parameters: Dict[str, Any],
-        executor: Optional[Callable[[Dict], str]] = None,
+        parameters: dict[str, Any],
+        executor: Callable[[dict], str] | None = None,
     ):
         self.name = name
         self.description = description
@@ -76,15 +79,15 @@ class LocalModelConfig:
     def __init__(
         self,
         model_path: str,
-        model_name: Optional[str] = None,
+        model_name: str | None = None,
         n_gpu_layers: int = -1,
         n_ctx: int = 32768,
         n_batch: int = 512,
-        n_threads: Optional[int] = None,
+        n_threads: int | None = None,
         verbose: bool = False,
         f16_kv: bool = True,
         # Speculative decoding
-        draft_model_path: Optional[str] = None,
+        draft_model_path: str | None = None,
         draft_model_gpu_layers: int = 0,
         speculative_lookahead: int = 4,
     ):
@@ -127,15 +130,15 @@ class LocalModel(ModelInterface):
         self._check_oom_risk(self.model_path)
 
         self._lock = Lock()
-        self._grammar_cache: Dict[str, LlamaGrammar] = {}
-        self._tools: Dict[str, ToolDefinition] = {}
+        self._grammar_cache: dict[str, LlamaGrammar] = {}
+        self._tools: dict[str, ToolDefinition] = {}
         self._metrics = {
             "total_calls": 0,
             "total_tokens": 0,
             "total_time_ms": 0.0,
             "errors": 0,
         }
-        self._healthy: Optional[bool] = None
+        self._healthy: bool | None = None
         self._last_health_check = 0.0
 
         logger.info(
@@ -159,7 +162,7 @@ class LocalModel(ModelInterface):
             raise RuntimeError(f"Model loading failed: {exc}") from exc
 
         # Speculative decoding — optional draft model
-        self._draft_llm: Optional[Llama] = None
+        self._draft_llm: Llama | None = None
         if config.draft_model_path:
             self._load_draft_model(config)
 
@@ -204,13 +207,13 @@ class LocalModel(ModelInterface):
     def generate(
         self,
         prompt: str,
-        grammar: Optional[str] = None,
+        grammar: str | None = None,
         max_tokens: int = 1000,
         temperature: float = 0.7,
         top_p: float = 0.9,
-        stop: Optional[List[str]] = None,
+        stop: list[str] | None = None,
         stream: bool = False,
-    ) -> Union[str, Iterator[str]]:
+    ) -> str | Iterator[str]:
         grammar_obj = self._get_grammar(grammar)
         if stream:
             return self._stream_iter(prompt, grammar_obj, max_tokens, temperature, top_p, stop)
@@ -221,11 +224,11 @@ class LocalModel(ModelInterface):
     def _generate_blocking(
         self,
         prompt: str,
-        grammar_obj: Optional[LlamaGrammar],
+        grammar_obj: LlamaGrammar | None,
         max_tokens: int,
         temperature: float,
         top_p: float,
-        stop: Optional[List[str]],
+        stop: list[str] | None,
     ) -> str:
         start = time.time()
         try:
@@ -261,11 +264,11 @@ class LocalModel(ModelInterface):
     def _stream_iter(
         self,
         prompt: str,
-        grammar_obj: Optional[LlamaGrammar],
+        grammar_obj: LlamaGrammar | None,
         max_tokens: int,
         temperature: float,
         top_p: float,
-        stop: Optional[List[str]],
+        stop: list[str] | None,
     ) -> Iterator[str]:
         gen = self.llm(
             prompt=prompt,
@@ -285,11 +288,11 @@ class LocalModel(ModelInterface):
     async def generate_async(
         self,
         prompt: str,
-        grammar: Optional[str] = None,
+        grammar: str | None = None,
         max_tokens: int = 1000,
         temperature: float = 0.7,
         top_p: float = 0.9,
-        stop: Optional[List[str]] = None,
+        stop: list[str] | None = None,
     ) -> str:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
@@ -308,12 +311,12 @@ class LocalModel(ModelInterface):
     async def generate_stream_async(
         self,
         prompt: str,
-        grammar: Optional[str] = None,
+        grammar: str | None = None,
         max_tokens: int = 1000,
         temperature: float = 0.7,
     ) -> AsyncIterator[str]:
         loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
+        queue: asyncio.Queue[str | None] = asyncio.Queue()
 
         def _produce() -> None:
             try:
@@ -368,7 +371,7 @@ class LocalModel(ModelInterface):
     def generate_speculative(
         self,
         prompt: str,
-        grammar: Optional[str] = None,
+        grammar: str | None = None,
         max_tokens: int = 1000,
         temperature: float = 0.7,
     ) -> str:
@@ -410,11 +413,11 @@ class LocalModel(ModelInterface):
     # ------------------------------------------------------------------
     def generate_batch(
         self,
-        prompts: List[str],
-        grammar: Optional[str] = None,
+        prompts: list[str],
+        grammar: str | None = None,
         max_tokens: int = 500,
         temperature: float = 0.7,
-    ) -> List[GenerationResult]:
+    ) -> list[GenerationResult]:
         grammar_obj = self._get_grammar(grammar)
         results = []
         for prompt in prompts:
@@ -449,8 +452,8 @@ class LocalModel(ModelInterface):
         self,
         name: str,
         description: str,
-        parameters: Dict[str, Any],
-        executor: Optional[Callable[[Dict], str]] = None,
+        parameters: dict[str, Any],
+        executor: Callable[[dict], str] | None = None,
     ) -> None:
         self._tools[name] = ToolDefinition(
             name=name,
@@ -460,7 +463,7 @@ class LocalModel(ModelInterface):
         )
         logger.debug(f"[LocalModel] Registered tool: {name}")
 
-    def execute_tool(self, tool_call: ToolCall) -> Optional[str]:
+    def execute_tool(self, tool_call: ToolCall) -> str | None:
         tool = self._tools.get(tool_call.name)
         if not tool or not tool.executor:
             return None
@@ -473,10 +476,10 @@ class LocalModel(ModelInterface):
     def generate_with_tools(
         self,
         prompt: str,
-        tools: Optional[List[ToolDefinition]] = None,
+        tools: list[ToolDefinition] | None = None,
         max_tokens: int = 2000,
         temperature: float = 0.7,
-    ) -> Union[str, ToolCall]:
+    ) -> str | ToolCall:
         tools = tools or list(self._tools.values())
         grammar = self._build_tool_call_grammar([t.name for t in tools])
         sys_prompt = self._build_tool_prompt(prompt, tools)
@@ -491,7 +494,7 @@ class LocalModel(ModelInterface):
         except json.JSONDecodeError:
             return response
 
-    def _build_tool_prompt(self, user_prompt: str, tools: List[ToolDefinition]) -> str:
+    def _build_tool_prompt(self, user_prompt: str, tools: list[ToolDefinition]) -> str:
         descs = "\n".join(
             f"Tool: {t.name}\nDescription: {t.description}\nParameters: {json.dumps(t.parameters)}"
             for t in tools
@@ -504,7 +507,7 @@ class LocalModel(ModelInterface):
             f'User: {user_prompt}\n\nResponse:'
         )
 
-    def _build_tool_call_grammar(self, tool_names: List[str]) -> str:
+    def _build_tool_call_grammar(self, tool_names: list[str]) -> str:
         name_alts = " | ".join(f'"{n}"' for n in tool_names)
         return (
             'root ::= tool-call | text-resp\n'
@@ -570,7 +573,7 @@ class LocalModel(ModelInterface):
     def generate_result(
         self,
         prompt: str,
-        config: Optional[GenerationConfig] = None,
+        config: GenerationConfig | None = None,
     ) -> InterfaceGenerationResult:
         cfg = config or GenerationConfig()
         start = time.time()
@@ -596,7 +599,7 @@ class LocalModel(ModelInterface):
     def generate_stream(
         self,
         prompt: str,
-        config: Optional[GenerationConfig] = None,
+        config: GenerationConfig | None = None,
     ) -> Iterator[str]:
         cfg = config or GenerationConfig()
         return self._stream_iter(
@@ -608,7 +611,7 @@ class LocalModel(ModelInterface):
             cfg.stop,
         )
 
-    def tokenize(self, text: str) -> List[int]:
+    def tokenize(self, text: str) -> list[int]:
         return list(self.llm.tokenize(text.encode()))
 
     def get_context_length(self) -> int:
@@ -650,7 +653,7 @@ class LocalModel(ModelInterface):
         self._metrics["total_tokens"] += tokens
         self._metrics["total_time_ms"] += ms
 
-    def get_metrics(self) -> Dict[str, Any]:
+    def get_metrics(self) -> dict[str, Any]:
         calls = self._metrics["total_calls"]
         ms = self._metrics["total_time_ms"]
         return {
@@ -663,8 +666,8 @@ class LocalModel(ModelInterface):
             "speculative_decoding": self._draft_llm is not None,
         }
 
-    def get_memory_usage(self) -> Dict[str, float]:
-        result: Dict[str, float] = {}
+    def get_memory_usage(self) -> dict[str, float]:
+        result: dict[str, float] = {}
         try:
             import torch
             if torch.cuda.is_available():
@@ -688,7 +691,7 @@ class LocalModel(ModelInterface):
     # ------------------------------------------------------------------
     # Grammar cache
     # ------------------------------------------------------------------
-    def _get_grammar(self, grammar_str: Optional[str]) -> Optional[LlamaGrammar]:
+    def _get_grammar(self, grammar_str: str | None) -> LlamaGrammar | None:
         if not grammar_str:
             return None
         if grammar_str not in self._grammar_cache:
@@ -731,10 +734,10 @@ class LocalModelError(Exception):
 # ---------------------------------------------------------------------------
 def load_local_model(
     model_path: str,
-    model_name: Optional[str] = None,
+    model_name: str | None = None,
     n_gpu_layers: int = -1,
     n_ctx: int = 32768,
-    draft_model_path: Optional[str] = None,
+    draft_model_path: str | None = None,
     speculative_lookahead: int = 4,
     **kwargs,
 ) -> LocalModel:
@@ -749,7 +752,7 @@ def load_local_model(
     ))
 
 
-def load_models_for_swarm(configs: List[Dict[str, Any]]) -> List[LocalModel]:
+def load_models_for_swarm(configs: list[dict[str, Any]]) -> list[LocalModel]:
     models = []
     for cfg in configs:
         try:

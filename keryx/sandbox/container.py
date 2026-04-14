@@ -18,8 +18,7 @@ import shutil
 import tempfile
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 # FIX 1: correct path — shared_context lives in keryx/core/
 try:
@@ -29,7 +28,7 @@ except ImportError:
 
 # FIX 2: correct path — toolbox lives in keryx/tools/, container in keryx/sandbox/
 try:
-    from ..tools.toolbox import ToolResult
+    from ..tools.Toolbox import ToolResult
 except ImportError:
     ToolResult = Any  # type: ignore
 
@@ -71,10 +70,10 @@ def scrub_sandbox_output(text: str) -> str:
 class SandboxResult:
     success:           bool
     output:            str
-    error:             Optional[str]       = None
+    error:             str | None       = None
     execution_time_ms: float               = 0.0
     exit_code:         int                 = 0
-    data:              Dict[str, Any]      = field(default_factory=dict)
+    data:              dict[str, Any]      = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -115,11 +114,11 @@ class IsolatedContainer:
         # FIX 8: lazy init — don't ping Docker in __init__ (blocks event loop)
         self._docker_client   = None
         self._docker_checked  = False
-        self._docker_available: Optional[bool] = None
+        self._docker_available: bool | None = None
 
-        self.container:       Optional[Any]    = None
-        self._container_id:   Optional[str]    = None
-        self._temp_volumes:   List[str]        = []
+        self.container:       Any | None    = None
+        self._container_id:   str | None    = None
+        self._temp_volumes:   list[str]        = []
 
         logger.info(
             f"[IsolatedContainer] Initialized | image={image} | "
@@ -165,7 +164,7 @@ class IsolatedContainer:
     # Lifecycle
     # ------------------------------------------------------------------
 
-    async def start(self, volumes: Optional[Dict[str, Dict[str, str]]] = None) -> bool:
+    async def start(self, volumes: dict[str, dict[str, str]] | None = None) -> bool:
         if not await self._ensure_docker():
             return False
         if self.container:
@@ -250,9 +249,9 @@ class IsolatedContainer:
 
     async def execute_command(
         self,
-        command:  List[str],
+        command:  list[str],
         workdir:  str            = "/workspace",
-        timeout:  Optional[float] = None,
+        timeout:  float | None = None,
     ) -> SandboxResult:
         if not self.container:
             return SandboxResult(success=False, output="Container not started", error="container_not_ready")
@@ -296,7 +295,7 @@ class IsolatedContainer:
                 data={"command": " ".join(command)},
             )
 
-        except asyncio.TimeoutError:
+        except TimeoutError:
             duration_ms = (time.time() - start) * 1000
             logger.error(f"[IsolatedContainer] Timeout: {' '.join(command[:4])} ({effective_timeout}s)")
             return SandboxResult(
@@ -321,10 +320,10 @@ class IsolatedContainer:
 
     async def compile_with_asan(
         self,
-        source_files:  List[str],
+        source_files:  list[str],
         output_binary: str,
         workdir:       str            = "/workspace",
-        extra_flags:   Optional[List[str]] = None,
+        extra_flags:   list[str] | None = None,
     ) -> SandboxResult:
         """Compile C/C++ sources with AddressSanitizer inside the sandbox."""
         cmd = [
@@ -392,7 +391,7 @@ class IsolatedContainer:
     # Context manager
     # ------------------------------------------------------------------
 
-    async def __aenter__(self) -> "IsolatedContainer":
+    async def __aenter__(self) -> IsolatedContainer:
         await self.start()
         return self
 
@@ -431,11 +430,11 @@ async def create_sandbox(
 
 
 async def run_in_sandbox(
-    command:        List[str],
+    command:        list[str],
     image:          str   = "keryx/hunter-base:latest",
     timeout:        float = 60.0,
     enable_network: bool  = False,
-    volumes:        Optional[Dict[str, Dict[str, str]]] = None,
+    volumes:        dict[str, dict[str, str]] | None = None,
 ) -> SandboxResult:
     """
     One-shot: start sandbox, run command, stop sandbox.

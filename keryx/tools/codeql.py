@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -14,11 +15,11 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any
 
 import psutil
 
-from .toolbox import BaseTool, ToolResult
+from .Toolbox import BaseTool, ToolResult
 
 logger = logging.getLogger("keryx.tools.codeql")
 
@@ -40,12 +41,12 @@ def kill_process_tree(pid: int, timeout: float = 5.0) -> None:
         parent   = psutil.Process(pid)
         children = parent.children(recursive=True)
         for child in children:
-            try: child.terminate()
-            except psutil.NoSuchProcess: pass
+            with contextlib.suppress(psutil.NoSuchProcess):
+                child.terminate()
         gone, alive = psutil.wait_procs(children, timeout=timeout / 2)
         for child in alive:
-            try: child.kill()
-            except psutil.NoSuchProcess: pass
+            with contextlib.suppress(psutil.NoSuchProcess):
+                child.kill()
         try:
             parent.terminate()
             parent.wait(timeout=timeout / 2)
@@ -89,9 +90,9 @@ class CodeQLFinding:
     file:       str
     line:       int
     severity:   str                  = "warning"
-    flow_steps: List[Dict[str, Any]] = field(default_factory=list)
+    flow_steps: list[dict[str, Any]] = field(default_factory=list)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "rule_id":    self.rule_id,
             "message":    self.message[:300],
@@ -139,14 +140,14 @@ class CodeQLTool(BaseTool):
 
     def __init__(
         self,
-        codeql_path:      Optional[str]   = None,
-        default_db_path:  Optional[str]   = None,
+        codeql_path:      str | None   = None,
+        default_db_path:  str | None   = None,
         timeout_seconds:  float           = 180.0,
         max_results:      int             = 50,
         enable_scrubbing: bool            = True,
         auto_create_db:   bool            = True,
         persistent_db:    bool            = False,
-        ram_limit_mb:     Optional[int]   = None,
+        ram_limit_mb:     int | None   = None,
     ):
         self.codeql_path     = codeql_path or shutil.which("codeql") or "codeql"
         self.default_db_path = Path(default_db_path or ".keryx_codeql_db")
@@ -160,8 +161,8 @@ class CodeQLTool(BaseTool):
         self._available = bool(shutil.which(self.codeql_path))
 
         # FIX 7: track (db_path, language, build_command_hash) to detect stale DBs
-        self._db_session_keys: Set[str]  = set()
-        self._temp_dbs:         Set[str] = set()   # for cleanup
+        self._db_session_keys: set[str]  = set()
+        self._temp_dbs:         set[str] = set()   # for cleanup
 
         if not self._available:
             logger.warning(f"[CodeQLTool] Binary not found: {self.codeql_path}")
@@ -173,14 +174,14 @@ class CodeQLTool(BaseTool):
     def is_available(self) -> bool:
         return self._available
 
-    def list_available_queries(self) -> Dict[str, str]:
+    def list_available_queries(self) -> dict[str, str]:
         return self.QUERY_BUNDLES.copy()
 
     # ------------------------------------------------------------------
     # FIX 8: get_command() for native subprocess execution by agent.py
     # ------------------------------------------------------------------
 
-    def get_command(self, action_input: Dict[str, Any]) -> Optional[List[str]]:
+    def get_command(self, action_input: dict[str, Any]) -> list[str] | None:
         """
         Return None — CodeQL runs as Python-managed subprocess internally.
         agent.py falls back to run_in_executor → toolbox.execute().
@@ -192,7 +193,7 @@ class CodeQLTool(BaseTool):
     # FIX 6: replaces unreliable __del__
     # ------------------------------------------------------------------
 
-    def __enter__(self) -> "CodeQLTool":
+    def __enter__(self) -> CodeQLTool:
         return self
 
     def __exit__(self, *_: Any) -> bool:
@@ -205,7 +206,7 @@ class CodeQLTool(BaseTool):
 
     async def execute(
         self,
-        action_input: Dict[str, Any],
+        action_input: dict[str, Any],
         context: Any = None,
     ) -> ToolResult:
         if not self._available:
@@ -280,7 +281,7 @@ class CodeQLTool(BaseTool):
                 },
             )
 
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return ToolResult(success=False, output=f"Timeout after {self.timeout}s", error="timeout")
         except Exception as exc:
             logger.error(f"[CodeQLTool] Unexpected: {exc}", exc_info=True)
@@ -294,7 +295,7 @@ class CodeQLTool(BaseTool):
         self,
         db_path:       str,
         language:      str,
-        build_command: Optional[str],
+        build_command: str | None,
         context:       Any,
     ) -> bool:
         source_root = str(getattr(context, 'target_path', '.')) if context else '.'
@@ -326,7 +327,7 @@ class CodeQLTool(BaseTool):
                 return True
             logger.error(f"[CodeQLTool] DB creation failed: {stderr.decode()[:400]}")
             return False
-        except asyncio.TimeoutError:
+        except TimeoutError:
             kill_process_tree(proc.pid)
             return False
 
@@ -341,14 +342,14 @@ class CodeQLTool(BaseTool):
         self,
         query:   str,
         db_path: str,
-    ) -> Tuple[int, str, str]:
+    ) -> tuple[int, str, str]:
         """Route to suite-analysis or single-query path."""
         is_suite = query.startswith("codeql/") or ":" in query
         if is_suite:
             return await self._run_suite(query, db_path)
         return await self._run_single_query(query, db_path)
 
-    async def _run_suite(self, query: str, db_path: str) -> Tuple[int, str, str]:
+    async def _run_suite(self, query: str, db_path: str) -> tuple[int, str, str]:
         """
         Run a query suite via 'database analyze'.
         FIX 3: analyze writes to a file, not stdout. Use temp file.
@@ -378,13 +379,13 @@ class CodeQLTool(BaseTool):
             except Exception:
                 content = ""
             return 0, content, ""
-        except asyncio.TimeoutError:
+        except TimeoutError:
             kill_process_tree(proc.pid)
             raise
         finally:
             Path(sarif_path).unlink(missing_ok=True)
 
-    async def _run_single_query(self, query: str, db_path: str) -> Tuple[int, str, str]:
+    async def _run_single_query(self, query: str, db_path: str) -> tuple[int, str, str]:
         """
         Run single .ql file: query run → BQRS → bqrs interpret → SARIF.
         FIX 4: 'bqrs decode' doesn't produce SARIF — use 'bqrs interpret'.
@@ -412,7 +413,7 @@ class CodeQLTool(BaseTool):
                 _, stderr = await asyncio.wait_for(proc.communicate(), timeout=self.timeout)
                 if proc.returncode != 0:
                     return proc.returncode, "", stderr.decode()
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 kill_process_tree(proc.pid)
                 raise
 
@@ -436,7 +437,7 @@ class CodeQLTool(BaseTool):
                     return proc2.returncode, "", stderr2.decode()
                 content = Path(sarif_path).read_text(encoding='utf-8')
                 return 0, content, ""
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 kill_process_tree(proc2.pid)
                 raise
 
@@ -454,7 +455,7 @@ class CodeQLTool(BaseTool):
         sarif_json:   str,
         limit:        int,
         include_flow: bool,
-    ) -> List[CodeQLFinding]:
+    ) -> list[CodeQLFinding]:
         if not sarif_json.strip():
             return []
         try:
@@ -462,7 +463,7 @@ class CodeQLTool(BaseTool):
             findings = []
             for run in data.get("runs", []):
                 # FIX 5: build severity lookup once per run
-                rule_severity: Dict[str, str] = {}
+                rule_severity: dict[str, str] = {}
                 for rule in run.get("tool", {}).get("driver", {}).get("rules", []):
                     rid = rule.get("id", "")
                     rule_severity[rid] = (
@@ -494,8 +495,8 @@ class CodeQLTool(BaseTool):
             logger.warning(f"[CodeQLTool] SARIF parse error: {exc}")
             return []
 
-    def _extract_flow_steps(self, result: Dict) -> List[Dict[str, Any]]:
-        steps: List[Dict] = []
+    def _extract_flow_steps(self, result: dict) -> list[dict[str, Any]]:
+        steps: list[dict] = []
         for flow in result.get("codeFlows", []):
             for thread in flow.get("threadFlows", []):
                 for loc_entry in thread.get("locations", []):
@@ -509,7 +510,7 @@ class CodeQLTool(BaseTool):
                         steps.append(step)
         return steps
 
-    def _build_summary(self, findings: List[CodeQLFinding]) -> str:
+    def _build_summary(self, findings: list[CodeQLFinding]) -> str:
         if not findings:
             return "No vulnerabilities found by CodeQL."
         lines = [f"Found {len(findings)} potential issue(s):\n"]
@@ -548,7 +549,7 @@ class CodeQLTool(BaseTool):
 # ---------------------------------------------------------------------------
 
 def create_codeql_tool(
-    codeql_path:     Optional[str] = None,
+    codeql_path:     str | None = None,
     timeout_seconds: float         = 180.0,
     persistent_db:   bool          = False,
     **kwargs,

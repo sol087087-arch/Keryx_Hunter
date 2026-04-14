@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional, Set
+from typing import Any
 
 
 @dataclass
@@ -11,9 +11,9 @@ class Evidence:
     """A piece of evidence supporting a vulnerability hypothesis."""
     location:    str                         # e.g. "js/src/vm/JSObject.cpp:1847"
     description: str
-    tags:        List[str]          = field(default_factory=list)
+    tags:        list[str]          = field(default_factory=list)
     timestamp:   float              = field(default_factory=time.time)
-    metadata:    Dict[str, Any]     = field(default_factory=dict)
+    metadata:    dict[str, Any]     = field(default_factory=dict)
 
 
 @dataclass
@@ -25,11 +25,11 @@ class AdvisorAdvice:
     """
     strategy:                    str            = ""
     strategic_direction:         str            = ""
-    adjust_confidence_threshold: Optional[float] = None
-    raw:                         Dict[str, Any]  = field(default_factory=dict)
+    adjust_confidence_threshold: float | None = None
+    raw:                         dict[str, Any]  = field(default_factory=dict)
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "AdvisorAdvice":
+    def from_dict(cls, d: dict[str, Any]) -> AdvisorAdvice:
         return cls(
             strategy=                    d.get("strategy", ""),
             strategic_direction=         d.get("strategic_direction", ""),
@@ -37,7 +37,7 @@ class AdvisorAdvice:
             raw=                         d,
         )
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "strategy":                    self.strategy,
             "strategic_direction":         self.strategic_direction,
@@ -57,27 +57,32 @@ class SharedContext:
     capability:  str = "deep_reasoning"
     mode:        str = "hybrid"
 
+    # Orchestrator escalation state — serialised so resume works correctly.
+    escalation_level: int = 1
+    # routing_plan is a RoutingPlan dataclass; not serialised (too complex).
+    routing_plan: Any | None = field(default=None, repr=False)
+
     # Core state
     # FIX 7: steps_taken is managed ONLY by add_step() — agent.py must not
     # increment it directly.  The field is still public for checkpoint restore.
     steps_taken:     int                    = 0
-    steps:           List[Dict[str, Any]]   = field(default_factory=list)
-    hypotheses:      Set[str]               = field(default_factory=set)
-    blacklist:       Set[str]               = field(default_factory=set)
-    confirmed_vulns: List[Dict[str, Any]]   = field(default_factory=list)
-    scanned_files:   List[str]              = field(default_factory=list)
+    steps:           list[dict[str, Any]]   = field(default_factory=list)
+    hypotheses:      set[str]               = field(default_factory=set)
+    blacklist:       set[str]               = field(default_factory=set)
+    confirmed_vulns: list[dict[str, Any]]   = field(default_factory=list)
+    scanned_files:   list[str]              = field(default_factory=list)
     parse_errors:    int                    = 0
 
     # Advisor state
-    advisor_advice:         List[AdvisorAdvice]      = field(default_factory=list)
-    pending_advisor_advice: Optional[AdvisorAdvice]  = None
+    advisor_advice:         list[AdvisorAdvice]      = field(default_factory=list)
+    pending_advisor_advice: AdvisorAdvice | None  = None
     _advisor_guidance:      str                       = field(default="", init=False)
 
     # Critique log
-    _critiques: List[str] = field(default_factory=list, init=False)
+    _critiques: list[str] = field(default_factory=list, init=False)
 
     # Evidence
-    evidence: List[Evidence] = field(default_factory=list)
+    evidence: list[Evidence] = field(default_factory=list)
 
     # Runtime metrics (not serialised — reset on resume is fine)
     _start_time: float = field(default_factory=time.time, init=False)
@@ -91,15 +96,29 @@ class SharedContext:
         Record a completed step.
         FIX 7: this is the ONLY place steps_taken is incremented.
         agent.py must not do `self.context.steps_taken += 1` separately.
+
+        FIX SERIALIZATION: AgentStep dataclass objects are not JSON-serialisable.
+        Convert to a plain dict here so that to_dict() / checkpoint write never
+        hits 'TypeError: Object of type AgentStep is not JSON serializable'.
+        Readers (get_recent_history, get_last_confidence) use dict key access.
         """
+        if hasattr(action, "action"):
+            action_record: Any = {
+                "name":       getattr(action, "action", str(action)),
+                "input":      getattr(action, "action_input", {}),
+                "thought":    getattr(action, "thought", ""),
+                "confidence": getattr(action, "confidence", 0.0),
+            }
+        else:
+            action_record = str(action)
         self.steps.append({
             "timestamp":   time.time(),
-            "action":      action,
+            "action":      action_record,
             "observation": observation[:1000],
         })
         self.steps_taken += 1
 
-    def get_last_step(self) -> Optional[Dict[str, Any]]:
+    def get_last_step(self) -> dict[str, Any] | None:
         """FIX 2: was missing — called by agent._self_critique_async()."""
         return self.steps[-1] if self.steps else None
 
@@ -111,12 +130,17 @@ class SharedContext:
         recent = self.steps[-n:]
         if not recent:
             return "No steps taken yet."
-        lines: List[str] = []
+        lines: list[str] = []
         for i, s in enumerate(recent, 1):
             action      = s.get("action", {})
-            action_name = getattr(action, "action", str(action))
+            # action is now always a dict (stored by add_step) or str fallback
+            if isinstance(action, dict):
+                action_name = action.get("name", str(action))
+                confidence  = action.get("confidence")
+            else:
+                action_name = str(action)
+                confidence  = None
             observation = s.get("observation", "")
-            confidence  = getattr(action, "confidence", None)
             conf_str    = f" | conf={confidence:.2f}" if confidence is not None else ""
             lines.append(
                 f"  [{i}] {action_name}{conf_str}\n"
@@ -124,16 +148,18 @@ class SharedContext:
             )
         return "\n".join(lines)
 
-    def get_last_confidence(self) -> Optional[float]:
+    def get_last_confidence(self) -> float | None:
         """
         FIX 9: was a stub returning None — escalation logic never fired.
-        Now reads confidence from the last recorded AgentStep.
+        Now reads confidence from the last recorded step dict.
         """
         last = self.get_last_step()
         if last is None:
             return None
         action = last.get("action")
-        return getattr(action, "confidence", None)
+        if isinstance(action, dict):
+            return action.get("confidence")
+        return None
 
     def trim_history(self, keep: int = 6) -> None:
         """
@@ -167,6 +193,10 @@ class SharedContext:
         """FIX 1: was missing — called 3 times in agent.py."""
         self.parse_errors += 1
 
+    def set_escalation_level(self, level: int) -> None:
+        """Called by KeryxOrchestrator when progressive escalation advances."""
+        self.escalation_level = level
+
     # ------------------------------------------------------------------
     # Evidence and critique
     # ------------------------------------------------------------------
@@ -175,7 +205,7 @@ class SharedContext:
         self,
         location:    str,
         description: str,
-        tags:        Optional[List[str]] = None,
+        tags:        list[str] | None = None,
     ) -> None:
         self.evidence.append(Evidence(location, description, tags or []))
 
@@ -217,7 +247,7 @@ class SharedContext:
         self.advisor_advice.append(typed)
         self.pending_advisor_advice = typed
 
-    def get_pending_advisor_advice(self) -> Optional[AdvisorAdvice]:
+    def get_pending_advisor_advice(self) -> AdvisorAdvice | None:
         return self.pending_advisor_advice
 
     def has_pending_advisor_advice(self) -> bool:
@@ -250,7 +280,7 @@ class SharedContext:
             f"Runtime:                 {runtime}s"
         )
 
-    def get_metrics(self) -> Dict[str, Any]:
+    def get_metrics(self) -> dict[str, Any]:
         return {
             "runtime_sec":        round(time.time() - self._start_time, 2),
             "steps_count":        len(self.steps),
@@ -264,12 +294,13 @@ class SharedContext:
     # JSON serialisation (replaces pickle — no arbitrary code execution)
     # ------------------------------------------------------------------
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
-            "target_path":    self.target_path,
-            "capability":     self.capability,
-            "mode":           self.mode,
-            "steps_taken":    self.steps_taken,
+            "target_path":       self.target_path,
+            "capability":        self.capability,
+            "mode":              self.mode,
+            "escalation_level":  self.escalation_level,
+            "steps_taken":       self.steps_taken,
             "steps":          self.steps,
             "hypotheses":     list(self.hypotheses),
             "blacklist":      list(self.blacklist),
@@ -283,11 +314,12 @@ class SharedContext:
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "SharedContext":
+    def from_dict(cls, data: dict[str, Any]) -> SharedContext:
         ctx = cls(
-            target_path=data.get("target_path", ""),
-            capability= data.get("capability", "deep_reasoning"),
-            mode=       data.get("mode", "hybrid"),
+            target_path=      data.get("target_path", ""),
+            capability=       data.get("capability", "deep_reasoning"),
+            mode=             data.get("mode", "hybrid"),
+            escalation_level= data.get("escalation_level", 1),
         )
         ctx.steps_taken     = data.get("steps_taken", 0)
         ctx.steps           = data.get("steps", [])

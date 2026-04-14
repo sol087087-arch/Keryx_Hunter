@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import math
 import os
@@ -16,9 +17,9 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
-from .toolbox import ToolResult, BaseTool
+from .Toolbox import BaseTool, ToolResult
 
 logger = logging.getLogger("keryx.tools.git_blame")
 
@@ -30,7 +31,7 @@ class _GitResult:
     output:     str
     stderr:     str
     exit_code:  int
-    authors:    List[str] = field(default_factory=list)
+    authors:    list[str] = field(default_factory=list)
 
 
 class GitBlameTool(BaseTool):
@@ -62,7 +63,7 @@ class GitBlameTool(BaseTool):
 
     def __init__(
         self,
-        git_path:         Optional[str] = None,
+        git_path:         str | None = None,
         timeout_seconds:  float         = 30.0,
         max_output_lines: int           = 200,
         enable_scrubbing: bool          = True,
@@ -99,7 +100,7 @@ class GitBlameTool(BaseTool):
 
     async def execute(
         self,
-        action_input: Dict[str, Any],
+        action_input: dict[str, Any],
         context:      Any = None,
     ) -> ToolResult:
         """
@@ -153,7 +154,7 @@ class GitBlameTool(BaseTool):
             else:
                 result = await self._git_log(action_input)
 
-        except asyncio.TimeoutError:
+        except TimeoutError:
             duration_ms = (time.time() - start) * 1000
             self._record_call(success=False, duration_ms=duration_ms)
             logger.error("[GitBlameTool] %s timed out after %.0fs", cmd_type, self.timeout)
@@ -210,7 +211,7 @@ class GitBlameTool(BaseTool):
     # blame
     # ------------------------------------------------------------------
 
-    async def _git_blame(self, action_input: Dict[str, Any]) -> _GitResult:
+    async def _git_blame(self, action_input: dict[str, Any]) -> _GitResult:
         file_path = action_input.get("file", "")
         line_num  = action_input.get("line")
 
@@ -230,7 +231,7 @@ class GitBlameTool(BaseTool):
     # log
     # ------------------------------------------------------------------
 
-    async def _git_log(self, action_input: Dict[str, Any]) -> _GitResult:
+    async def _git_log(self, action_input: dict[str, Any]) -> _GitResult:
         n_commits = int(action_input.get("n", 10))
         log_path  = action_input.get("path")
         author    = action_input.get("author")
@@ -258,7 +259,7 @@ class GitBlameTool(BaseTool):
     # hotspots
     # ------------------------------------------------------------------
 
-    async def _run_hotspots(self, action_input: Dict[str, Any]) -> ToolResult:
+    async def _run_hotspots(self, action_input: dict[str, Any]) -> ToolResult:
         """
         Churn analysis: files with high change frequency and many authors.
 
@@ -296,7 +297,7 @@ class GitBlameTool(BaseTool):
                 )
 
             # ── Step 2: count churn per file ───────────────────────────────
-            churn: Dict[str, int] = {}
+            churn: dict[str, int] = {}
             for line in raw.output.splitlines():
                 line = line.strip()
                 if not line:
@@ -308,7 +309,7 @@ class GitBlameTool(BaseTool):
 
             # ── Step 3: fetch authors for top-15 candidates ────────────────
             candidates = sorted(churn.items(), key=lambda kv: kv[1], reverse=True)[:15]
-            authors_by_file: Dict[str, set] = {}
+            authors_by_file: dict[str, set] = {}
 
             for filepath, changes in candidates:
                 if changes < min_churn:
@@ -400,7 +401,7 @@ class GitBlameTool(BaseTool):
                 },
             )
 
-        except asyncio.TimeoutError:
+        except TimeoutError:
             duration_ms = (time.time() - start) * 1000
             self._record_call(success=False, duration_ms=duration_ms)
             logger.error("[GitBlameTool] Hotspots timed out after %.0fs", self.timeout)
@@ -425,8 +426,8 @@ class GitBlameTool(BaseTool):
 
     async def _run_cmd(
         self,
-        cmd:             List[str],
-        extract_authors: Optional[str] = None,
+        cmd:             list[str],
+        extract_authors: str | None = None,
     ) -> _GitResult:
         """
         Run a git command, wait up to self.timeout, kill on timeout.
@@ -440,7 +441,7 @@ class GitBlameTool(BaseTool):
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=self.timeout
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self._kill_proc(proc)
             raise
 
@@ -449,7 +450,7 @@ class GitBlameTool(BaseTool):
         output    = stdout.decode("utf-8", errors="replace")
         err_out   = stderr.decode("utf-8", errors="replace")
 
-        authors: List[str] = []
+        authors: list[str] = []
         if extract_authors == "blame":
             authors = _extract_blame_authors(output)
         elif extract_authors == "log":
@@ -464,8 +465,8 @@ class GitBlameTool(BaseTool):
         )
 
     @staticmethod
-    async def _create_proc(cmd: List[str]) -> asyncio.subprocess.Process:
-        kwargs: Dict[str, Any] = {
+    async def _create_proc(cmd: list[str]) -> asyncio.subprocess.Process:
+        kwargs: dict[str, Any] = {
             "stdout": asyncio.subprocess.PIPE,
             "stderr": asyncio.subprocess.PIPE,
         }
@@ -483,10 +484,8 @@ class GitBlameTool(BaseTool):
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except (ProcessLookupError, OSError):
-            try:
+            with contextlib.suppress(Exception):
                 proc.kill()
-            except Exception:
-                pass
 
     # ------------------------------------------------------------------
     # Output helpers
@@ -511,7 +510,7 @@ class GitBlameTool(BaseTool):
 # Pure-function helpers (no self dependency — easier to test)
 # ---------------------------------------------------------------------------
 
-def _extract_blame_authors(output: str) -> List[str]:
+def _extract_blame_authors(output: str) -> list[str]:
     seen: set = set()
     for line in output.splitlines():
         if line.startswith("author "):
@@ -521,7 +520,7 @@ def _extract_blame_authors(output: str) -> List[str]:
     return sorted(seen)[:10]
 
 
-def _extract_log_authors(output: str) -> List[str]:
+def _extract_log_authors(output: str) -> list[str]:
     seen: set = set()
     for line in output.splitlines():
         parts = line.split("|")
@@ -554,7 +553,7 @@ def _scrub(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 def create_git_blame_tool(
-    git_path:        Optional[str] = None,
+    git_path:        str | None = None,
     timeout_seconds: float         = 30.0,
     **kwargs: Any,
 ) -> GitBlameTool:
@@ -567,8 +566,8 @@ def create_git_blame_tool(
 
 async def get_file_blame(
     file_path: str,
-    line:      Optional[int] = None,
-) -> Dict[str, Any]:
+    line:      int | None = None,
+) -> dict[str, Any]:
     tool   = create_git_blame_tool()
     result = await tool.execute({"command": "blame", "file": file_path, "line": line})
     return {
@@ -581,11 +580,11 @@ async def get_file_blame(
 
 async def get_commit_log(
     n:      int           = 10,
-    path:   Optional[str] = None,
-    author: Optional[str] = None,
-    grep:   Optional[str] = None,
-    since:  Optional[str] = None,
-) -> Dict[str, Any]:
+    path:   str | None = None,
+    author: str | None = None,
+    grep:   str | None = None,
+    since:  str | None = None,
+) -> dict[str, Any]:
     tool   = create_git_blame_tool()
     result = await tool.execute({
         "command": "log",
@@ -603,9 +602,9 @@ async def get_commit_log(
 async def get_hotspots(
     path:       str           = ".",
     n_commits:  int           = 100,
-    since:      Optional[str] = None,
-    extensions: Optional[List[str]] = None,
-) -> Dict[str, Any]:
+    since:      str | None = None,
+    extensions: list[str] | None = None,
+) -> dict[str, Any]:
     tool   = create_git_blame_tool()
     result = await tool.execute({
         "command": "hotspots",

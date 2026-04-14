@@ -4,18 +4,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
-import asyncio
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
-from ..models.interface import ModelInterface
-from ..tools.Toolbox import ToolBox
 from ..advisors.manager import AdvisorManager
 from ..core.shared_context import SharedContext
+from ..models.interface import ModelInterface
+from ..tools.Toolbox import ToolBox
 
 
 @dataclass
@@ -23,7 +23,7 @@ class AgentStep:
     """Single step in the ReAct loop."""
     thought:      str
     action:       str
-    action_input: Dict[str, Any]
+    action_input: dict[str, Any]
     observation:  str   = ""
     confidence:   float = 0.0
     timestamp:    float = field(default_factory=time.time)
@@ -62,7 +62,7 @@ class BudgetController:
     def remaining_budget(self) -> float:
         return self.max_cost_usd - self.current_cost
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "max_cost_usd":      self.max_cost_usd,
             "current_cost":      self.current_cost,
@@ -122,9 +122,10 @@ class KeryxAgent:
         max_steps:            int            = 50,
         confidence_threshold: float          = 0.65,
         max_prompt_chars:     int            = 32_000,
-        checkpoint_dir:       Optional[Path] = None,
+        checkpoint_dir:       Path | None = None,
         generate_timeout:     float          = 90.0,
-        budget_usd:           Optional[float]= None,
+        budget_usd:           float | None= None,
+        enforce_airgapped:    bool           = False,
     ) -> None:
         self.executor             = executor_model
         self.advisor_manager      = advisor_manager
@@ -134,13 +135,35 @@ class KeryxAgent:
         self.max_prompt_chars     = max_prompt_chars
         self.generate_timeout     = generate_timeout
         self.checkpoint_dir       = checkpoint_dir or Path(".keryx_checkpoints")
-        self.context: Optional[SharedContext] = None
+        self.enforce_airgapped    = enforce_airgapped
+        self._shared_context: SharedContext | None = None
 
         self.budget = BudgetController(max_cost_usd=budget_usd) if budget_usd else None
 
         self._steps_since_escalation:  int = _ESCALATION_COOLDOWN
         self._consecutive_failures:    int = 0
         self._max_consecutive_failures:int = 3
+
+    # ------------------------------------------------------------------
+    # Context property
+    # ------------------------------------------------------------------
+
+    @property
+    def context(self) -> SharedContext:
+        """Non-optional view of the shared context.
+
+        Valid only after run() initialises it.  Raises AssertionError with a
+        clear message if accessed before run() is called.
+        """
+        assert self._shared_context is not None, (
+            "KeryxAgent.context accessed before run() — call run() first."
+        )
+        return self._shared_context
+
+    @context.setter
+    def context(self, value: SharedContext) -> None:
+        """Allow external assignment (e.g. test fixtures) via the same name."""
+        self._shared_context = value
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -151,11 +174,20 @@ class KeryxAgent:
         target_path: str,
         capability:  str  = "deep_reasoning",
         resume:      bool = True,
-    ) -> Dict[str, Any]:
-        """Main hunt loop."""
-        self.context = self._load_checkpoint(target_path) if resume else None
-        if self.context is None:
-            self.context = SharedContext(target_path=target_path, capability=capability)
+        context: SharedContext | None = None,
+    ) -> dict[str, Any]:
+        """Main hunt loop.
+
+        context: pre-built SharedContext injected by KeryxOrchestrator so that
+                 accumulated state (steps, hypotheses, escalation level) is preserved
+                 across escalation attempts.  When provided, resume is ignored.
+        """
+        if context is not None:
+            self._shared_context = context
+        else:
+            self._shared_context = self._load_checkpoint(target_path) if resume else None
+        if self._shared_context is None:
+            self._shared_context = SharedContext(target_path=target_path, capability=capability)
 
         print(
             f"[Agent] Hunt starting | target={target_path} | capability={capability} "
@@ -164,6 +196,24 @@ class KeryxAgent:
         if self.budget:
             mode = "airgapped" if self.executor.is_local else "cloud"
             print(f"[Agent] Budget: ${self.budget.max_cost_usd} | Mode: {mode}")
+
+        # Enforce air-gapped constraint: refuse to run if a network model was
+        # selected despite the airgapped flag.  Checked once before the loop
+        # rather than per-step to surface the misconfiguration immediately.
+        if self.enforce_airgapped and getattr(self.executor, "requires_network", False):
+            print(
+                "[Agent] AIRGAP VIOLATION: executor requires network but "
+                "enforce_airgapped=True — aborting hunt."
+            )
+            return {
+                "status": "failed",
+                "reason": "airgap_violation",
+                "target": self.context.target_path,
+                "steps_taken": self.context.steps_taken,
+                "confirmed_vulns": [],
+                "hypotheses": list(self.context.hypotheses),
+                "average_confidence": 0.0,
+            }
 
         while self.context.steps_taken < self.max_steps:
 
@@ -239,7 +289,7 @@ class KeryxAgent:
                     critique = await self._self_critique_async()
                     self._apply_critique(critique, action)
 
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     msg = f"Tool '{action.action}' timed out after {_TOOL_TIMEOUT_SECONDS}s"
                     print(f"[ERROR] {msg}")
                     action.observation = msg
@@ -303,14 +353,14 @@ class KeryxAgent:
         except Exception:
             return False
 
-    async def _safe_generate(self, prompt: str) -> Optional[AgentStep]:
+    async def _safe_generate(self, prompt: str) -> AgentStep | None:
         for attempt in range(2):
             try:
                 raw = await asyncio.wait_for(
                     self._generate_async(prompt),
                     timeout=self.generate_timeout,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 print(f"[WARN] Generation timeout (attempt {attempt + 1})")
                 # FIX 4: count generation timeouts as parse errors
                 self.context.increment_parse_errors()
@@ -332,11 +382,15 @@ class KeryxAgent:
             ),
         )
 
-    async def _execute_tool_async(self, action: str, action_input: Dict[str, Any]) -> str:
+    async def _execute_tool_async(self, action: str, action_input: dict[str, Any]) -> str:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
+        result = await loop.run_in_executor(
             None, self.tools.execute, action, action_input
         )
+        # ToolBox.execute() returns ToolResult; extract text so add_step() gets a str.
+        if hasattr(result, "output"):
+            return result.output if result.output is not None else str(result)
+        return str(result)
 
     async def _self_critique_async(self) -> str:
         prompt = (
@@ -355,7 +409,7 @@ class KeryxAgent:
                 ),
                 timeout=15.0,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return "Critique timed out — proceeding with original hypothesis."
 
     def _apply_critique(self, critique: str, action: AgentStep) -> None:
@@ -406,7 +460,7 @@ class KeryxAgent:
     # Parsing
     # ------------------------------------------------------------------
 
-    def _extract_json(self, raw: str) -> Optional[str]:
+    def _extract_json(self, raw: str) -> str | None:
         raw = raw.strip()
         if raw.startswith("```"):
             parts = raw.split("```")
@@ -566,7 +620,7 @@ class KeryxAgent:
         except Exception as exc:
             print(f"[WARN] Checkpoint save failed: {exc}")
 
-    def _load_checkpoint(self, target_path: str) -> Optional[SharedContext]:
+    def _load_checkpoint(self, target_path: str) -> SharedContext | None:
         """FIX 6: load from JSON — no arbitrary code execution."""
         path = self._checkpoint_path(target_path)
         if not path.exists():
@@ -609,7 +663,7 @@ class KeryxAgent:
         )
         return any(s in observation for s in signals)
 
-    def _generate_final_report(self) -> Dict[str, Any]:
+    def _generate_final_report(self) -> dict[str, Any]:
         return {
             "status":           "completed",
             "target":           self.context.target_path,

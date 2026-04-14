@@ -14,11 +14,11 @@ import logging
 import random
 import re
 import time
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any
 
-from .base import BaseAdvisor, AdvisorResponse
 from ..models.interface import ModelInterface
+from .base import AdvisorResponse, BaseAdvisor
 
 try:
     from ..core.shared_context import SharedContext
@@ -43,7 +43,7 @@ class RetryConfig:
 # ---------------------------------------------------------------------------
 # Privacy scrubbing patterns
 # ---------------------------------------------------------------------------
-_SCRUB_PATTERNS: List[Tuple[str, str]] = [
+_SCRUB_PATTERNS: list[tuple[str, str]] = [
     (r'/home/[^/\s]+/[^/\s]+', '/workspace'),
     (r'/Users/[^/\s]+/[^/\s]+', '/workspace'),
     (r'[A-Za-z]:\\.*', 'C:\\workspace'),
@@ -83,8 +83,8 @@ class CloudAdvisor(BaseAdvisor):
     def __init__(
         self,
         model: ModelInterface,
-        toolbox: Optional[Any] = None,
-        local_digest_model: Optional[ModelInterface] = None,
+        toolbox: Any | None = None,
+        local_digest_model: ModelInterface | None = None,
         max_calls_per_session: int = 3,
         confidence_threshold: float = 0.45,
         max_parse_errors: int = 3,
@@ -92,8 +92,8 @@ class CloudAdvisor(BaseAdvisor):
         temperature: float = 0.3,
         max_tokens: int = 800,
         request_timeout: float = 30.0,
-        budget_limit_usd: Optional[float] = 2.0,
-        retry_config: Optional[RetryConfig] = None,
+        budget_limit_usd: float | None = 2.0,
+        retry_config: RetryConfig | None = None,
         enable_scrubbing: bool = True,
         enable_digest: bool = True,
         **kwargs,
@@ -118,7 +118,7 @@ class CloudAdvisor(BaseAdvisor):
         self._session_cost_usd: float = 0.0
         self._total_input_tokens: int = 0
         self._total_output_tokens: int = 0
-        self._tools_cache: Optional[List[str]] = None
+        self._tools_cache: list[str] | None = None
         self._tools_cache_time: float = 0.0
 
         logger.info(
@@ -130,7 +130,7 @@ class CloudAdvisor(BaseAdvisor):
     # ------------------------------------------------------------------
     # Pre-flight
     # ------------------------------------------------------------------
-    def _check_preflight(self) -> Tuple[bool, str]:
+    def _check_preflight(self) -> tuple[bool, str]:
         if self.calls_made >= self.max_calls_per_session:
             return False, "call_limit"
         if self.budget_limit_usd and self._session_cost_usd >= self.budget_limit_usd:
@@ -198,7 +198,7 @@ class CloudAdvisor(BaseAdvisor):
     # ------------------------------------------------------------------
     # Prompt building with digest + scrubbing
     # ------------------------------------------------------------------
-    async def _build_secure_prompt(self, context: Any, available_tools: List[str]) -> str:
+    async def _build_secure_prompt(self, context: Any, available_tools: list[str]) -> str:
         # Step 1: Summarize history locally if digest enabled
         if self.enable_digest and self.local_digest_model:
             history = await self._generate_local_digest(context)
@@ -336,7 +336,7 @@ class CloudAdvisor(BaseAdvisor):
         self,
         raw: str,
         context: Any,
-        available_tools: List[str],
+        available_tools: list[str],
     ) -> AdvisorResponse:
         raw = raw.strip()
 
@@ -364,7 +364,7 @@ class CloudAdvisor(BaseAdvisor):
         if invalid:
             logger.warning(f"[{self.name}] Filtered hallucinated tools: {invalid}")
 
-        def _str_list(key: str, limit: int) -> List[str]:
+        def _str_list(key: str, limit: int) -> list[str]:
             return [h for h in data.get(key, []) if isinstance(h, str)][:limit]
 
         return AdvisorResponse(
@@ -384,7 +384,7 @@ class CloudAdvisor(BaseAdvisor):
             },
         )
 
-    def _clamp_threshold(self, value: Any) -> Optional[float]:
+    def _clamp_threshold(self, value: Any) -> float | None:
         if value is None:
             return None
         try:
@@ -395,7 +395,7 @@ class CloudAdvisor(BaseAdvisor):
     # ------------------------------------------------------------------
     # Tools cache
     # ------------------------------------------------------------------
-    def _get_available_tools(self, context: Any) -> List[str]:
+    def _get_available_tools(self, context: Any) -> list[str]:
         now = time.time()
         if self._tools_cache is not None and now - self._tools_cache_time < 5.0:
             return self._tools_cache
@@ -440,7 +440,7 @@ class CloudAdvisor(BaseAdvisor):
         self._tools_cache_time = 0.0
         logger.debug(f"[{self.name}] Reset complete")
 
-    def get_metrics(self) -> Dict[str, Any]:
+    def get_metrics(self) -> dict[str, Any]:
         return {
             **super().get_metrics(),
             "model": self.model.model_name,
@@ -465,7 +465,7 @@ class CloudAdvisor(BaseAdvisor):
 # ---------------------------------------------------------------------------
 def create_cloud_advisor(
     model: ModelInterface,
-    local_digest_model: Optional[ModelInterface] = None,
+    local_digest_model: ModelInterface | None = None,
     **kwargs,
 ) -> CloudAdvisor:
     return CloudAdvisor(model=model, local_digest_model=local_digest_model, **kwargs)

@@ -11,10 +11,10 @@ import os
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set
+from dataclasses import dataclass
+from typing import Any
 
-from .base import BaseAdvisor, AdvisorResponse
+from .base import AdvisorResponse, BaseAdvisor
 
 logger = logging.getLogger("keryx.advisors.manager")
 
@@ -55,7 +55,7 @@ class AdvisorHealth:
         self.total_latency_ms += latency_ms
         self.is_open = False
 
-    def record_failure(self, exc: Optional[BaseException] = None) -> None:
+    def record_failure(self, exc: BaseException | None = None) -> None:
         self.total_calls += 1
         if exc is None or _is_system_error(exc):
             self.consecutive_system_failures += 1
@@ -109,16 +109,16 @@ class AdvisorManager:
     """
     def __init__(
         self,
-        default_advisor_name: Optional[str] = None,
-        max_concurrent_advisor_calls: Optional[int] = None,
+        default_advisor_name: str | None = None,
+        max_concurrent_advisor_calls: int | None = None,
         enable_circuit_breaker: bool = True,
     ):
-        self._advisors: Dict[str, BaseAdvisor] = {}
-        self._health: Dict[str, AdvisorHealth] = {}
-        self._default: Optional[str] = default_advisor_name
+        self._advisors: dict[str, BaseAdvisor] = {}
+        self._health: dict[str, AdvisorHealth] = {}
+        self._default: str | None = default_advisor_name
         self._lock = threading.RLock()
         self._enable_cb = enable_circuit_breaker
-        self._priorities: Dict[str, int] = {}
+        self._priorities: dict[str, int] = {}
 
         workers = max_concurrent_advisor_calls or min(os.cpu_count() or 2, 4)
         if workers > 8:
@@ -128,12 +128,12 @@ class AdvisorManager:
             )
 
         # Dedicated background loop for sync bridge
-        self._sync_loop: Optional[asyncio.AbstractEventLoop] = None
-        self._sync_thread: Optional[threading.Thread] = None
+        self._sync_loop: asyncio.AbstractEventLoop | None = None
+        self._sync_thread: threading.Thread | None = None
         self._loop_ready = threading.Event()
 
         # Metrics
-        self._call_history: deque = deque(maxlen=1000)
+        self._call_history: deque[CallMetrics] = deque(maxlen=1000)
         self._total_calls: int = 0
         self._fallback_count: int = 0
 
@@ -153,7 +153,7 @@ class AdvisorManager:
     # ------------------------------------------------------------------
     # Context manager
     # ------------------------------------------------------------------
-    async def __aenter__(self) -> "AdvisorManager":
+    async def __aenter__(self) -> AdvisorManager:
         return self
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool:
@@ -172,7 +172,7 @@ class AdvisorManager:
                 self._default = advisor.name
             logger.info(f"[AdvisorManager] Registered: {advisor.name!r} (priority={priority})")
 
-    def register_many(self, advisors: List[tuple]) -> None:
+    def register_many(self, advisors: list[tuple[BaseAdvisor, int]]) -> None:
         for advisor, priority in advisors:
             self.register(advisor, priority)
 
@@ -200,10 +200,10 @@ class AdvisorManager:
     def has_advisor(self, name: str) -> bool:
         return name in self._advisors
 
-    def get_advisor(self, name: str) -> Optional[BaseAdvisor]:
+    def get_advisor(self, name: str) -> BaseAdvisor | None:
         return self._advisors.get(name)
 
-    def list_advisors(self) -> List[str]:
+    def list_advisors(self) -> list[str]:
         return sorted(self._advisors.keys(), key=lambda n: self._priorities.get(n, 50))
 
     # ------------------------------------------------------------------
@@ -212,9 +212,9 @@ class AdvisorManager:
     async def get_advice_async(
         self,
         context: Any,
-        advisor_name: Optional[str] = None,
-        fallback_chain: Optional[List[str]] = None,
-        _visited: Optional[Set[str]] = None,
+        advisor_name: str | None = None,
+        fallback_chain: list[str] | None = None,
+        _visited: set[str] | None = None,
     ) -> AdvisorResponse:
         _visited = _visited or set()
         name = advisor_name or self._default
@@ -241,7 +241,7 @@ class AdvisorManager:
             triggered = await asyncio.wait_for(
                 advisor.should_trigger_async(context), timeout=5.0
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning(f"[AdvisorManager] Trigger check timeout: {name!r}")
             triggered = False
 
@@ -250,7 +250,7 @@ class AdvisorManager:
 
         # Execute
         start = time.time()
-        system_exc: Optional[BaseException] = None
+        system_exc: BaseException | None = None
 
         try:
             logger.info(f"[AdvisorManager] Executing: {name!r}")
@@ -264,7 +264,7 @@ class AdvisorManager:
             self._total_calls += 1
             return response
 
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             system_exc = exc
             logger.error(f"[AdvisorManager] {name!r} timed out")
         except _SYSTEM_ERRORS as exc:
@@ -291,8 +291,8 @@ class AdvisorManager:
     async def _try_fallback(
         self,
         context: Any,
-        chain: Optional[List[str]],
-        visited: Set[str],
+        chain: list[str] | None,
+        visited: set[str],
         reason: str,
     ) -> AdvisorResponse:
         if not chain:
@@ -310,7 +310,7 @@ class AdvisorManager:
     async def get_advice_priority(
         self,
         context: Any,
-        advisor_names: Optional[List[str]] = None,
+        advisor_names: list[str] | None = None,
     ) -> AdvisorResponse:
         names = advisor_names or list(self._advisors.keys())
         sorted_names = sorted(names, key=lambda n: self._priorities.get(n, 50))
@@ -328,10 +328,10 @@ class AdvisorManager:
     async def get_advice_parallel(
         self,
         context: Any,
-        advisor_names: List[str],
+        advisor_names: list[str],
         require_all: bool = False,
         timeout: float = 30.0,
-    ) -> List[AdvisorResponse]:
+    ) -> list[AdvisorResponse]:
         valid = [n for n in advisor_names if n in self._advisors]
         if not valid:
             return []
@@ -348,7 +348,7 @@ class AdvisorManager:
                 asyncio.gather(*tasks, return_exceptions=True),
                 timeout=timeout,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning(f"[AdvisorManager] Parallel timeout after {timeout}s")
             for t in tasks:
                 if not t.done():
@@ -390,8 +390,8 @@ class AdvisorManager:
     def get_advice(
         self,
         context: Any,
-        advisor_name: Optional[str] = None,
-        fallback_chain: Optional[List[str]] = None,
+        advisor_name: str | None = None,
+        fallback_chain: list[str] | None = None,
     ) -> AdvisorResponse:
         try:
             asyncio.get_running_loop()
@@ -416,7 +416,7 @@ class AdvisorManager:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-    def can_advise(self, advisor_name: Optional[str] = None) -> bool:
+    def can_advise(self, advisor_name: str | None = None) -> bool:
         if advisor_name:
             adv = self._advisors.get(advisor_name)
             health = self._health.get(advisor_name)
@@ -437,7 +437,7 @@ class AdvisorManager:
             triggered=triggered,
         ))
 
-    def get_metrics(self) -> Dict[str, Any]:
+    def get_metrics(self) -> dict[str, Any]:
         now = time.time()
         recent = [c for c in self._call_history if now - c.timestamp < 300]
         return {
@@ -457,8 +457,8 @@ class AdvisorManager:
         }
 
     @staticmethod
-    def _latency_histogram(calls: List[CallMetrics]) -> Dict[str, int]:
-        buckets: Dict[str, int] = {"<100ms": 0, "100-500ms": 0, "0.5-1s": 0, "1-5s": 0, ">5s": 0}
+    def _latency_histogram(calls: list[CallMetrics]) -> dict[str, int]:
+        buckets: dict[str, int] = {"<100ms": 0, "100-500ms": 0, "0.5-1s": 0, "1-5s": 0, ">5s": 0}
         for c in calls:
             if c.latency_ms < 100:
                 buckets["<100ms"] += 1
@@ -472,7 +472,7 @@ class AdvisorManager:
                 buckets[">5s"] += 1
         return buckets
 
-    def get_advisor_health(self, name: str) -> Optional[AdvisorHealth]:
+    def get_advisor_health(self, name: str) -> AdvisorHealth | None:
         return self._health.get(name)
 
     # ------------------------------------------------------------------
@@ -522,9 +522,9 @@ class AdvisorManager:
 # Factory
 # ---------------------------------------------------------------------------
 def create_advisor_manager(
-    advisors: Optional[List[tuple]] = None,
-    default: Optional[str] = None,
-    **kwargs,
+    advisors: list[tuple[BaseAdvisor, int]] | None = None,
+    default: str | None = None,
+    **kwargs: Any,
 ) -> AdvisorManager:
     manager = AdvisorManager(default_advisor_name=default, **kwargs)
     if advisors:

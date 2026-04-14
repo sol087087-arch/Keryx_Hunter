@@ -5,8 +5,8 @@ update_models_2026.py
 Только имена моделей. Ничего больше не меняется.
 """
 
-from pathlib import Path
 import re
+from pathlib import Path
 
 # ==================== ТОЧНЫЙ МАППИНГ 2026 ====================
 MODEL_MAP = {

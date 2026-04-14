@@ -40,7 +40,7 @@ __version_tuple__ = get_version_tuple()
 #      schemas exports input validators and typed result records only.
 # ---------------------------------------------------------------------------
 
-from .core.schemas import (       # noqa: E402
+from .core.schemas import (  # noqa: E402
     GitBlameInput,
     HotspotEntry,
     MetricsSnapshot,
@@ -49,8 +49,7 @@ from .core.schemas import (       # noqa: E402
 from .core.shared_context import SharedContext  # noqa: E402
 
 # ToolResult from toolbox — the one the whole pipeline uses.
-from .tools.Toolbox import ToolResult           # noqa: E402
-
+from .tools.Toolbox import ToolResult  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Lazy loading map
@@ -136,9 +135,9 @@ async def hunt(
         result = await keryx.hunt("/path/to/firefox", mode="airgapped")
     """
     # FIX: lazy imports keep startup fast; imported here not at module level.
-    from .core.orchestrator  import KeryxOrchestrator
-    from .tools.Toolbox      import ToolBox
-    from .advisors.manager   import AdvisorManager
+    from .advisors.manager import AdvisorManager
+    from .core.orchestrator import KeryxOrchestrator
+    from .tools.Toolbox import ToolBox
 
     _toolbox  = toolbox  or ToolBox()
     _advisors = advisors or AdvisorManager()

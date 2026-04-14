@@ -8,11 +8,11 @@ import asyncio
 import inspect
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Any, Dict, List, Optional
+from typing import Any
 
-from .base import BaseAdvisor, AdvisorResponse
+from .base import AdvisorResponse, BaseAdvisor
 
 logger = logging.getLogger("keryx.advisors.cascade")
 
@@ -21,7 +21,7 @@ _MIN_REMAINING_SECONDS = 0.5
 
 
 class ErrorSeverity(Enum):
-    TRANSIENT = auto() 
+    TRANSIENT = auto()
     RECOVERABLE = auto()
     CRITICAL = auto()
 
@@ -32,8 +32,8 @@ class AdvisorState:
     disabled: bool = False
     consecutive_failures: int = 0
     total_time_ms: float = 0.0
-    last_error: Optional[str] = None
-    last_error_severity: Optional[ErrorSeverity] = None
+    last_error: str | None = None
+    last_error_severity: ErrorSeverity | None = None
 
 
 class CascadeAdvisor(BaseAdvisor):
@@ -53,7 +53,7 @@ class CascadeAdvisor(BaseAdvisor):
 
     def __init__(
         self,
-        advisors: List[BaseAdvisor],
+        advisors: list[BaseAdvisor],
         name: str = "cascade-advisor",
         max_calls_per_session: int = 5,
         cascade_timeout: float = 60.0,
@@ -73,7 +73,7 @@ class CascadeAdvisor(BaseAdvisor):
         self.cascade_timeout = cascade_timeout
         self.critical_confidence_threshold = critical_confidence_threshold
         self.disable_on_critical = disable_on_critical
-        self._chain: List[AdvisorState] = [AdvisorState(a) for a in advisors]
+        self._chain: list[AdvisorState] = [AdvisorState(a) for a in advisors]
 
         logger.info(
             f"[{self.name}] chain=[{', '.join(a.advisor.name for a in self._chain)}] | "
@@ -122,9 +122,9 @@ class CascadeAdvisor(BaseAdvisor):
     # ------------------------------------------------------------------
     async def advise(self, context: Any) -> AdvisorResponse:
         start = time.monotonic()
-        path: List[str] = []
-        timing: Dict[str, float] = {}
-        errors: Dict[str, str] = {}
+        path: list[str] = []
+        timing: dict[str, float] = {}
+        errors: dict[str, str] = {}
 
         conf = getattr(context, 'get_last_confidence', lambda: 1.0)()
         critical = (conf is not None) and (conf < self.critical_confidence_threshold)
@@ -185,7 +185,7 @@ class CascadeAdvisor(BaseAdvisor):
 
                 logger.debug(f"[{self.name}] '{advisor.name}' returned empty — next")
 
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 adv_ms = (time.monotonic() - adv_start) * 1000
                 state.total_time_ms += adv_ms
                 state.consecutive_failures += 1
@@ -230,9 +230,9 @@ class CascadeAdvisor(BaseAdvisor):
     @staticmethod
     def _enrich_response(
         response: AdvisorResponse,
-        path: List[str],
-        timing: Dict[str, float],
-        errors: Dict[str, str],
+        path: list[str],
+        timing: dict[str, float],
+        errors: dict[str, str],
     ) -> AdvisorResponse:
         from dataclasses import replace
         new_meta = dict(response.metadata or {})
@@ -246,9 +246,9 @@ class CascadeAdvisor(BaseAdvisor):
 
     def _empty_response(
         self,
-        path: List[str],
-        timing: Dict[str, float],
-        errors: Dict[str, str],
+        path: list[str],
+        timing: dict[str, float],
+        errors: dict[str, str],
         budget_exhausted: bool,
     ) -> AdvisorResponse:
         return AdvisorResponse(
@@ -290,7 +290,7 @@ class CascadeAdvisor(BaseAdvisor):
             except Exception as exc:
                 logger.warning(f"[{self.name}] Failed to reset '{state.advisor.name}': {exc}")
 
-    def get_metrics(self) -> Dict[str, Any]:
+    def get_metrics(self) -> dict[str, Any]:
         return {
             **super().get_metrics(),
             "chain_length": len(self._chain),
@@ -313,7 +313,7 @@ class CascadeAdvisor(BaseAdvisor):
 # Factory
 # ---------------------------------------------------------------------------
 def create_cascade_advisor(
-    advisors: List[BaseAdvisor],
+    advisors: list[BaseAdvisor],
     name: str = "cascade-advisor",
     cascade_timeout: float = 60.0,
     critical_confidence_threshold: float = 0.3,

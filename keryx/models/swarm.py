@@ -9,17 +9,16 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass, field
-from typing import Dict, List, Any, Optional, Tuple
+from dataclasses import dataclass
 
-from .interface import ModelInterface, GenerationConfig
+from .interface import ModelInterface
 
 logger = logging.getLogger("keryx.models.swarm")
 
 
 # ---------------------------------------------------------------------------
 # GBNF grammar for strict verdict JSON output
-# 
+#
 # FIX 2: 'true'/'false' as RULE NAMES shadow GBNF built-ins and are rejected
 # by the llama.cpp grammar validator. Renamed to 'bool-val', 'bool-true',
 # 'bool-false'. JSON boolean literals are just quoted directly.
@@ -60,10 +59,10 @@ class SwarmVote:
 @dataclass
 class SwarmResult:
     """Aggregated result of a full swarm debate."""
-    hypotheses: List[str]
-    confirmed: List[str]
-    rejected: List[str]
-    votes: Dict[str, List[SwarmVote]]
+    hypotheses: list[str]
+    confirmed: list[str]
+    rejected: list[str]
+    votes: dict[str, list[SwarmVote]]
     weighted_consensus_ratio: float
     raw_consensus_ratio: float
     swarm_voters: int
@@ -81,7 +80,7 @@ class ModelWeight:
     capability_tier: int = 50
 
 
-_DEFAULT_WEIGHTS: Dict[str, ModelWeight] = {
+_DEFAULT_WEIGHTS: dict[str, ModelWeight] = {
     "claude-3.5-sonnet": ModelWeight("claude-3.5-sonnet", 1.45, 100),
     "gpt-5.4": ModelWeight("gpt-5.4", 1.35, 98),
     "gpt-5-turbo": ModelWeight("gpt-5-turbo", 1.40, 99),
@@ -108,16 +107,16 @@ class SwarmDebate:
     """
     def __init__(
         self,
-        models: List[ModelInterface],
+        models: list[ModelInterface],
         consensus_threshold: float = 0.67,
         swarm_timeout: float = 60.0,
         max_tokens_per_response: int = 800,
         enable_iterative_debate: bool = False,
         max_debate_rounds: int = 2,
         use_weighted_voting: bool = True,
-        skeptic_model: Optional[ModelInterface] = None,
+        skeptic_model: ModelInterface | None = None,
         skeptic_weight_multiplier: float = 1.2,
-        model_weights: Optional[Dict[str, float]] = None,
+        model_weights: dict[str, float] | None = None,
         max_concurrent: int = 2,
     ):
         self.models = models
@@ -130,7 +129,7 @@ class SwarmDebate:
         self.skeptic_weight_multiplier = skeptic_weight_multiplier
         self.consensus_threshold = self._calculate_threshold(models, consensus_threshold)
 
-        self.model_weights: Dict[str, float] = {}
+        self.model_weights: dict[str, float] = {}
         for model in models:
             name = model.model_name
             if model_weights and name in model_weights:
@@ -152,17 +151,21 @@ class SwarmDebate:
     # ------------------------------------------------------------------
     # Threshold & weight helpers
     # ------------------------------------------------------------------
-    def _calculate_threshold(self, models: List[ModelInterface], default: float) -> float:
+    def _calculate_threshold(self, models: list[ModelInterface], default: float) -> float:
         frontier = {"claude-3.5-sonnet", "gpt-5.4", "gpt-5-turbo"}
         has_frontier = any(m.model_name in frontier for m in models)
         return 0.60 if has_frontier else 0.75
 
     def _detect_weight(self, name: str) -> float:
         nl = name.lower()
-        if any(x in nl for x in ("70b", "405b")): return 1.25
-        if any(x in nl for x in ("32b", "34b")): return 1.10
-        if "13b" in nl: return 0.90
-        if any(x in nl for x in ("8b", "7b")): return 0.75
+        if any(x in nl for x in ("70b", "405b")):
+            return 1.25
+        if any(x in nl for x in ("32b", "34b")):
+            return 1.10
+        if "13b" in nl:
+            return 0.90
+        if any(x in nl for x in ("8b", "7b")):
+            return 0.75
         return 1.0
 
     # ------------------------------------------------------------------
@@ -170,8 +173,8 @@ class SwarmDebate:
     # ------------------------------------------------------------------
     async def debate(
         self,
-        hypotheses: List[str],
-        context: Optional[str] = None,
+        hypotheses: list[str],
+        context: str | None = None,
     ) -> SwarmResult:
         start = time.time()
         if not hypotheses or not self.models:
@@ -216,20 +219,20 @@ class SwarmDebate:
     # ------------------------------------------------------------------
     async def _parallel_debate(
         self,
-        hypotheses: List[str],
-        context: Optional[str],
+        hypotheses: list[str],
+        context: str | None,
     ) -> SwarmResult:
         tasks = [self._analyze_with_model(m, hypotheses, context) for m in self.models]
         timeout_occurred = False
         try:
             async with asyncio.timeout(self.swarm_timeout):
                 model_results = await asyncio.gather(*tasks, return_exceptions=True)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning(f"[SwarmDebate] Timed out after {self.swarm_timeout}s")
-            model_results = [asyncio.TimeoutError() for _ in tasks]
+            model_results = [TimeoutError() for _ in tasks]
             timeout_occurred = True
 
-        votes: Dict[str, List[SwarmVote]] = {h: [] for h in hypotheses}
+        votes: dict[str, list[SwarmVote]] = {h: [] for h in hypotheses}
         valid_voters = 0
 
         for i, res in enumerate(model_results):
@@ -261,11 +264,11 @@ class SwarmDebate:
     # ------------------------------------------------------------------
     async def _iterative_debate(
         self,
-        hypotheses: List[str],
-        context: Optional[str],
+        hypotheses: list[str],
+        context: str | None,
     ) -> SwarmResult:
-        all_votes: Dict[str, List[SwarmVote]] = {h: [] for h in hypotheses}
-        history: List[str] = []
+        all_votes: dict[str, list[SwarmVote]] = {h: [] for h in hypotheses}
+        history: list[str] = []
         round_used = 0
         per_round_timeout = self.swarm_timeout / max(self.max_debate_rounds, 1)
 
@@ -278,11 +281,11 @@ class SwarmDebate:
             try:
                 async with asyncio.timeout(per_round_timeout):
                     results = await asyncio.gather(*tasks, return_exceptions=True)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning(f"[SwarmDebate] Round {rnd} timed out")
                 break
 
-            round_reasoning: List[str] = []
+            round_reasoning: list[str] = []
             for i, res in enumerate(results):
                 if isinstance(res, Exception):
                     continue
@@ -320,9 +323,9 @@ class SwarmDebate:
     async def _analyze_with_model(
         self,
         model: ModelInterface,
-        hypotheses: List[str],
-        context: Optional[str],
-    ) -> Dict[str, SwarmVote]:
+        hypotheses: list[str],
+        context: str | None,
+    ) -> dict[str, SwarmVote]:
         prompt = self._build_debate_prompt(hypotheses, context)
         start = time.time()
         try:
@@ -341,11 +344,11 @@ class SwarmDebate:
     async def _analyze_with_model_iterative(
         self,
         model: ModelInterface,
-        hypotheses: List[str],
-        context: Optional[str],
-        history: List[str],
+        hypotheses: list[str],
+        context: str | None,
+        history: list[str],
         round_num: int,
-    ) -> Dict[str, SwarmVote]:
+    ) -> dict[str, SwarmVote]:
         prompt = self._build_iterative_prompt(hypotheses, context, history, round_num)
         try:
             async with self._semaphore:
@@ -364,10 +367,10 @@ class SwarmDebate:
     # ------------------------------------------------------------------
     async def _run_skeptic_review(
         self,
-        candidates: List[str],
-        all_votes: Dict[str, List[SwarmVote]],
-        context: Optional[str],
-    ) -> Dict[str, SwarmVote]:
+        candidates: list[str],
+        all_votes: dict[str, list[SwarmVote]],
+        context: str | None,
+    ) -> dict[str, SwarmVote]:
         if not self.skeptic_model or not candidates:
             return {}
 
@@ -393,7 +396,7 @@ class SwarmDebate:
     def _apply_skeptic_overrides(
         self,
         result: SwarmResult,
-        skeptic_votes: Dict[str, SwarmVote],
+        skeptic_votes: dict[str, SwarmVote],
     ) -> int:
         overrides = 0
         for hyp, vote in list(skeptic_votes.items()):
@@ -406,7 +409,7 @@ class SwarmDebate:
     # ------------------------------------------------------------------
     # Prompt builders
     # ------------------------------------------------------------------
-    def _build_debate_prompt(self, hypotheses: List[str], context: Optional[str]) -> str:
+    def _build_debate_prompt(self, hypotheses: list[str], context: str | None) -> str:
         hyp_list = "\n".join(f"{i+1}. {h}" for i, h in enumerate(hypotheses))
         ctx_section = f"Context:\n{context[:1000]}\n\n" if context else ""
         return (
@@ -422,9 +425,9 @@ class SwarmDebate:
 
     def _build_iterative_prompt(
         self,
-        hypotheses: List[str],
-        context: Optional[str],
-        history: List[str],
+        hypotheses: list[str],
+        context: str | None,
+        history: list[str],
         round_num: int,
     ) -> str:
         base = self._build_debate_prompt(hypotheses, context)
@@ -435,9 +438,9 @@ class SwarmDebate:
 
     def _build_skeptic_prompt(
         self,
-        candidates: List[str],
-        all_votes: Dict[str, List[SwarmVote]],
-        context: Optional[str],
+        candidates: list[str],
+        all_votes: dict[str, list[SwarmVote]],
+        context: str | None,
     ) -> str:
         hyp_list = "\n".join(f"{i+1}. {h}" for i, h in enumerate(candidates))
         summary = []
@@ -467,10 +470,10 @@ class SwarmDebate:
     def _parse_verdict_json(
         self,
         raw: str,
-        hypotheses: List[str],
+        hypotheses: list[str],
         model_name: str,
         response_time_ms: float,
-    ) -> Dict[str, SwarmVote]:
+    ) -> dict[str, SwarmVote]:
         raw = raw.strip()
         if raw.startswith("```"):
             parts = raw.split("```")
@@ -479,7 +482,7 @@ class SwarmDebate:
 
         data = json.loads(raw)
         weight = self.model_weights.get(model_name, 1.0)
-        votes: Dict[str, SwarmVote] = {}
+        votes: dict[str, SwarmVote] = {}
 
         for item in data.get("hypotheses", []):
             idx = int(item.get("index", 0)) - 1
@@ -510,10 +513,10 @@ class SwarmDebate:
 
     def _neutral_votes(
         self,
-        hypotheses: List[str],
+        hypotheses: list[str],
         model_name: str,
         reason: str,
-    ) -> Dict[str, SwarmVote]:
+    ) -> dict[str, SwarmVote]:
         w = self.model_weights.get(model_name, 1.0)
         return {
             h: SwarmVote(
@@ -532,12 +535,12 @@ class SwarmDebate:
     # ------------------------------------------------------------------
     def _compute_consensus(
         self,
-        votes: Dict[str, List[SwarmVote]],
-        hypotheses: List[str],
+        votes: dict[str, list[SwarmVote]],
+        hypotheses: list[str],
         total_voters: int,
-    ) -> Tuple[List[str], List[str], float, float]:
-        confirmed: List[str] = []
-        rejected: List[str] = []
+    ) -> tuple[list[str], list[str], float, float]:
+        confirmed: list[str] = []
+        rejected: list[str] = []
         sum_w = 0.0
         sum_r = 0.0
 
@@ -600,12 +603,12 @@ class SwarmDebate:
 # Factories
 # ---------------------------------------------------------------------------
 def create_swarm_debate(
-    models: List[ModelInterface],
+    models: list[ModelInterface],
     consensus_threshold: float = 0.67,
     swarm_timeout: float = 60.0,
     enable_iterative_debate: bool = False,
     use_weighted_voting: bool = True,
-    skeptic_model: Optional[ModelInterface] = None,
+    skeptic_model: ModelInterface | None = None,
     max_concurrent: int = 2,
 ) -> SwarmDebate:
     return SwarmDebate(
@@ -616,4 +619,4 @@ def create_swarm_debate(
         use_weighted_voting=use_weighted_voting,
         skeptic_model=skeptic_model,
         max_concurrent=max_concurrent,
-    ) 
+    )

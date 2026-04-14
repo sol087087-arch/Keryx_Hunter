@@ -5,29 +5,36 @@
 # Requires Python 3.11+ (asyncio.timeout)
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
 import os
 import signal
 import socket
-from pathlib import Path
-from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
 import psutil
 
-from .router import CapabilityRouter, RoutingPlan, create_router
 from .agent import KeryxAgent
+from .router import RoutingPlan, create_router
 from .shared_context import SharedContext
 
 try:
-    from ..models.interface import ModelInterface
     from ..advisors.manager import AdvisorManager
-    from ..tools.toolbox import ToolBox
+    from ..models.interface import ModelInterface
+    from ..tools.Toolbox import ToolBox
 except ImportError:
-    ModelInterface = Any
-    AdvisorManager = Any
-    ToolBox = Any
+    if TYPE_CHECKING:
+        from ..advisors.manager import AdvisorManager
+        from ..models.interface import ModelInterface
+        from ..tools.Toolbox import ToolBox
+    else:
+        ModelInterface = object  # type: ignore[assignment,misc]
+        AdvisorManager = object  # type: ignore[assignment,misc]
+        ToolBox = object  # type: ignore[assignment,misc]
 
 logger = logging.getLogger("keryx.orchestrator")
 
@@ -47,7 +54,7 @@ class OrchestratorMetrics:
     escalation_levels_used: int = 1
     advisor_calls: int = 0
     tools_executed: int = 0
-    swarm_votes: Dict[str, int] = field(default_factory=dict)
+    swarm_votes: dict[str, int] = field(default_factory=dict)
 
 
 def _hyp_key(hyp: str) -> str:
@@ -76,10 +83,10 @@ class KeryxOrchestrator:
 
     def __init__(
         self,
-        available_models: Dict[str, "ModelInterface"],
+        available_models: dict[str, "ModelInterface"],
         advisor_manager: "AdvisorManager",
         toolbox: "ToolBox",
-        config_path: Optional[Path] = None,
+        config_path: Path | None = None,
         has_gpu: bool = False,
     ):
         self.available_models = available_models
@@ -88,7 +95,7 @@ class KeryxOrchestrator:
         self.has_gpu = has_gpu
         self.config_path = config_path
         self.router = create_router(config_path, has_gpu=has_gpu)
-        self._shared_context: Optional[SharedContext] = None
+        self._shared_context: SharedContext | None = None
         self._shutdown_event = asyncio.Event()
         self.metrics = OrchestratorMetrics()
 
@@ -105,8 +112,8 @@ class KeryxOrchestrator:
         capability: str = "deep_reasoning",
         mode: str = "hybrid",
         resume: bool = True,
-        user_budget_usd: Optional[float] = None,
-    ) -> Dict[str, Any]:
+        user_budget_usd: float | None = None,
+    ) -> dict[str, Any]:
         logger.info(
             f"[Orchestrator] Hunt started | mode={mode} | "
             f"capability={capability} | target={target_path}"
@@ -129,8 +136,8 @@ class KeryxOrchestrator:
         capability: str,
         mode: str,
         resume: bool,
-        user_budget_usd: Optional[float],
-    ) -> Dict[str, Any]:
+        user_budget_usd: float | None,
+    ) -> dict[str, Any]:
         is_airgapped = await self._is_airgapped(mode)
         plan: RoutingPlan = self.router.route(
             capability=capability,
@@ -154,12 +161,20 @@ class KeryxOrchestrator:
         max_escalation = 4 if not is_airgapped else 2
         attempts_at_level = 0
         max_attempts = 3
-        result: Optional[Dict] = None
+        result: dict[str, Any] | None = None
         iteration = 0
 
         while escalation_level <= max_escalation and not self._shutdown_event.is_set():
             iteration += 1
             logger.info(f"[Orchestrator] Escalation level {escalation_level}/{max_escalation}")
+            logger.debug(
+                "STATE level=%d | attempts=%d | hypotheses=%d | errors=%d | conf=%.2f",
+                escalation_level,
+                attempts_at_level,
+                len(self._shared_context.hypotheses),
+                self._shared_context.parse_errors,
+                result.get("average_confidence", -1.0) if result else -1.0,
+            )
 
             if not await self._check_resources():
                 logger.warning("[Orchestrator] Insufficient resources — stopping escalation")
@@ -172,14 +187,15 @@ class KeryxOrchestrator:
                 max_steps=100,
                 confidence_threshold=self._get_dynamic_threshold(escalation_level),
                 budget_usd=plan.budget_usd,
+                enforce_airgapped=plan.enforce_no_network,
             )
-            agent.context = self._shared_context
 
             try:
                 result = await agent.run(
                     target_path=target_path,
                     capability=capability,
                     resume=False,
+                    context=self._shared_context,
                 )
                 self._shared_context = agent.context
             except Exception as exc:
@@ -196,7 +212,7 @@ class KeryxOrchestrator:
             # Checkpoint after every iteration
             await self._save_checkpoint(target_path)
 
-            if self._should_escalate_further(result, escalation_level):
+            if self._should_escalate_further(result, escalation_level, max_escalation):
                 attempts_at_level += 1
                 if attempts_at_level >= max_attempts:
                     logger.info(f"[Orchestrator] Max attempts at level {escalation_level} — escalating")
@@ -284,7 +300,7 @@ class KeryxOrchestrator:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._write_atomic_json, path, state)
 
-    def _write_atomic_json(self, path: Path, data: Dict) -> None:
+    def _write_atomic_json(self, path: Path, data: dict[str, Any]) -> None:
         """Atomic write: .tmp → rename."""
         tmp = path.with_suffix(".tmp")
         try:
@@ -296,7 +312,7 @@ class KeryxOrchestrator:
             logger.error(f"Atomic checkpoint write failed: {exc}")
             tmp.unlink(missing_ok=True)
 
-    def _load_checkpoint(self, target_path: str) -> Optional[SharedContext]:
+    def _load_checkpoint(self, target_path: str) -> SharedContext | None:
         path = self._checkpoint_path(target_path)
         if not path.exists():
             return None
@@ -313,10 +329,10 @@ class KeryxOrchestrator:
     # ------------------------------------------------------------------
     # Swarm debate
     # ------------------------------------------------------------------
-    async def _run_swarm_debate(self, base_result: Dict, debate_models: List[str]) -> Dict:
+    async def _run_swarm_debate(self, base_result: dict[str, Any], debate_models: list[str]) -> dict[str, Any]:
         logger.info(f"[Orchestrator] Swarm debate | models={debate_models}")
         raw_hyps = base_result.get("hypotheses", [])
-        hypotheses: List[str] = [
+        hypotheses: list[str] = [
             h if isinstance(h, str) else json.dumps(h, ensure_ascii=False)
             for h in raw_hyps
         ]
@@ -333,14 +349,14 @@ class KeryxOrchestrator:
             self._analyze_with_model(self.available_models[m], hypotheses)
             for m in available_swarm
         ]
-        results: List[Any] = []
+        results: list[Any] = []
         try:
             async with asyncio.timeout(_SWARM_TIMEOUT):
                 results = await asyncio.gather(*tasks, return_exceptions=True)
         except TimeoutError:
             logger.warning(f"[Orchestrator] Swarm debate timed out after {_SWARM_TIMEOUT}s")
 
-        votes: Dict[str, int] = {_hyp_key(h): 0 for h in hypotheses}
+        votes: dict[str, int] = {_hyp_key(h): 0 for h in hypotheses}
         valid_voters = 0
         for i, r in enumerate(results):
             if isinstance(r, Exception):
@@ -353,7 +369,7 @@ class KeryxOrchestrator:
                     votes[k] = votes.get(k, 0) + 1
                     self.metrics.swarm_votes[k] = self.metrics.swarm_votes.get(k, 0) + 1
 
-        swarm_confirmed: List[str] = []
+        swarm_confirmed: list[str] = []
         if valid_voters > 0:
             swarm_confirmed = [
                 h for h in hypotheses
@@ -373,10 +389,10 @@ class KeryxOrchestrator:
         return base_result
 
     async def _analyze_with_model(
-        self, model: "ModelInterface", hypotheses: List[str]
-    ) -> Dict[str, bool]:
+        self, model: "ModelInterface", hypotheses: list[str]
+    ) -> dict[str, bool]:
         loop = asyncio.get_running_loop()
-        results: Dict[str, bool] = {}
+        results: dict[str, bool] = {}
         for hyp in hypotheses:
             try:
                 prompt = (
@@ -386,7 +402,7 @@ class KeryxOrchestrator:
                 raw = await asyncio.wait_for(
                     loop.run_in_executor(
                         None,
-                        lambda p=prompt: model.generate(p, max_tokens=10, grammar=None),
+                        lambda p=prompt: model.generate(p, max_tokens=10, grammar=None),  # type: ignore[misc]
                     ),
                     timeout=30.0,
                 )
@@ -408,7 +424,9 @@ class KeryxOrchestrator:
             pass
         return True
 
-    def _should_escalate_further(self, result: Dict, current_level: int) -> bool:
+    def _should_escalate_further(
+        self, result: dict[str, Any], current_level: int, max_escalation: int
+    ) -> bool:
         if not self._shared_context:
             return False
         if len(result.get("confirmed_vulns", [])) >= 1:
@@ -416,7 +434,7 @@ class KeryxOrchestrator:
         low_confidence = result.get("average_confidence", 0.0) < 0.5
         no_progress = len(self._shared_context.hypotheses) == 0
         too_many_errors = self._shared_context.parse_errors > 5
-        return (low_confidence or no_progress or too_many_errors) and current_level < 4
+        return (low_confidence or no_progress or too_many_errors) and current_level < max_escalation
 
     def _get_dynamic_threshold(self, escalation_level: int) -> float:
         return {1: 0.65, 2: 0.60, 3: 0.55, 4: 0.50}.get(escalation_level, 0.60)
@@ -430,15 +448,13 @@ class KeryxOrchestrator:
         except RuntimeError:
             return
 
-        def _handler():
+        def _handler() -> None:
             logger.warning("[Orchestrator] Shutdown signal received")
             self._shutdown_event.set()
 
         for sig in (signal.SIGTERM, signal.SIGINT):
-            try:
+            with contextlib.suppress(NotImplementedError, OSError):
                 loop.add_signal_handler(sig, _handler)
-            except (NotImplementedError, OSError):
-                pass
 
     def _cleanup_signal_handlers(self) -> None:
         try:
@@ -446,21 +462,19 @@ class KeryxOrchestrator:
         except RuntimeError:
             return
         for sig in (signal.SIGTERM, signal.SIGINT):
-            try:
+            with contextlib.suppress(NotImplementedError, RuntimeError, OSError):
                 loop.remove_signal_handler(sig)
-            except (NotImplementedError, RuntimeError, OSError):
-                pass
 
     # ------------------------------------------------------------------
     # Report helpers
     # ------------------------------------------------------------------
     def _build_final_result(
         self,
-        result: Optional[Dict],
+        result: dict[str, Any] | None,
         mode: str,
         is_airgapped: bool,
         escalation_level: int,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         if result is None:
             return {
                 "status": "cancelled",
@@ -477,7 +491,7 @@ class KeryxOrchestrator:
         })
         return result
 
-    def _generate_cancelled_report(self, target_path: str, mode: str) -> Dict[str, Any]:
+    def _generate_cancelled_report(self, target_path: str, mode: str) -> dict[str, Any]:
         return {
             "status": "cancelled",
             "target": target_path,
@@ -486,10 +500,10 @@ class KeryxOrchestrator:
             "metrics": self.get_metrics(),
         }
 
-    def get_shared_context(self) -> Optional[SharedContext]:
+    def get_shared_context(self) -> SharedContext | None:
         return self._shared_context
 
-    def get_metrics(self) -> Dict[str, Any]:
+    def get_metrics(self) -> dict[str, Any]:
         return {
             "routing_decisions": self.metrics.routing_decisions,
             "escalation_levels": self.metrics.escalation_levels_used,
@@ -506,10 +520,10 @@ class KeryxOrchestrator:
 # Convenience factory — sync, no async needed
 # ---------------------------------------------------------------------------
 def create_orchestrator(
-    models: Dict[str, "ModelInterface"],
+    models: dict[str, "ModelInterface"],
     advisors: "AdvisorManager",
     tools: "ToolBox",
-    config_path: Optional[Path] = None,
+    config_path: Path | None = None,
     has_gpu: bool = False,
 ) -> KeryxOrchestrator:
     return KeryxOrchestrator(

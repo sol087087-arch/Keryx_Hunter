@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import asyncio
-from typing import Any, Dict, Iterator, List, Optional, Union
+from collections.abc import Iterator
 
 from keryx.models.interface import (
     CostEstimate,
@@ -26,17 +25,17 @@ class MyLocalModel(ModelInterface):
     def generate(
         self,
         prompt: str,
-        config: Optional[GenerationConfig] = None,
+        config: GenerationConfig | None = None,
         *,
-        grammar: Optional[str] = None,
-        max_tokens: Optional[int] = None,
+        grammar: str | None = None,
+        max_tokens: int | None = None,
     ) -> str:
         return "Analysis: Potential buffer overflow in handle_packet..."
 
     def generate_result(
         self,
         prompt: str,
-        config: Optional[GenerationConfig] = None,
+        config: GenerationConfig | None = None,
     ) -> GenerationResult:
         text = self.generate(prompt, config)
         return GenerationResult(
@@ -51,16 +50,16 @@ class MyLocalModel(ModelInterface):
     def generate_stream(
         self,
         prompt: str,
-        config: Optional[GenerationConfig] = None,
+        config: GenerationConfig | None = None,
     ) -> Iterator[str]:
         yield self.generate(prompt, config)
 
     def generate_with_tools(
         self,
         prompt: str,
-        tools: List[ToolDefinition],
-        config: Optional[GenerationConfig] = None,
-    ) -> Union[str, ToolCall]:
+        tools: list[ToolDefinition],
+        config: GenerationConfig | None = None,
+    ) -> str | ToolCall:
         # Для мока пока возвращаем обычный текст
         return self.generate(prompt, config)
 
@@ -68,16 +67,16 @@ class MyLocalModel(ModelInterface):
     async def generate_async(
         self,
         prompt: str,
-        config: Optional[GenerationConfig] = None,
+        config: GenerationConfig | None = None,
         *,
-        grammar: Optional[str] = None,
-        max_tokens: Optional[int] = None,
+        grammar: str | None = None,
+        max_tokens: int | None = None,
     ) -> str:
         """Default implementation via base class is fine, but we override for clarity."""
         return self.generate(prompt, config, grammar=grammar, max_tokens=max_tokens)
 
     # ── Context ──────────────────────────────────────────────────────────
-    def tokenize(self, text: str) -> List[int]:
+    def tokenize(self, text: str) -> list[int]:
         # Rough approximation: ~4 chars per token
         return [0] * max(1, len(text) // 4)
 

@@ -5,13 +5,12 @@
 
 from __future__ import annotations
 
-import asyncio
 import inspect
 import logging
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 logger = logging.getLogger("keryx.advisors")
 
@@ -33,12 +32,12 @@ class AdvisorResponse:
     All fields optional — an advisor returns only what it knows.
     """
     strategic_direction: str = ""
-    adjust_confidence_threshold: Optional[float] = None
-    suggested_hypotheses: List[str] = field(default_factory=list)
-    blacklist_hypotheses: List[str] = field(default_factory=list)
-    suggested_tools: List[str] = field(default_factory=list)
-    priority_files: List[str] = field(default_factory=list)
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    adjust_confidence_threshold: float | None = None
+    suggested_hypotheses: list[str] = field(default_factory=list)
+    blacklist_hypotheses: list[str] = field(default_factory=list)
+    suggested_tools: list[str] = field(default_factory=list)
+    priority_files: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def is_empty(self) -> bool:
         """
@@ -90,7 +89,7 @@ class BaseAdvisor(ABC):
         self,
         max_calls_per_session: int = 5,
         cooldown_steps: int = 5,
-        **kwargs,
+        **kwargs: Any,
     ):
         self.max_calls_per_session = max_calls_per_session
         self.cooldown_steps = cooldown_steps
@@ -157,7 +156,7 @@ class BaseAdvisor(ABC):
         self._errors = 0
         self._total_time_ms = 0.0
 
-    def get_metrics(self) -> Dict[str, Any]:
+    def get_metrics(self) -> dict[str, Any]:
         avg = self._total_time_ms / self.calls_made if self.calls_made else 0.0
         return {
             "name": self.name,
@@ -194,10 +193,10 @@ class CascadeAdvisor(BaseAdvisor):
 
     def __init__(
         self,
-        advisors: List[BaseAdvisor],
+        advisors: list[BaseAdvisor],
         name: str = "cascade-advisor",
         max_calls_per_session: int = 5,
-        **kwargs,
+        **kwargs: Any,
     ):
         if not advisors:
             raise ValueError("CascadeAdvisor requires at least one advisor in chain")
@@ -254,7 +253,7 @@ class CascadeAdvisor(BaseAdvisor):
         for advisor in self._advisors:
             advisor.reset()
 
-    def get_metrics(self) -> Dict[str, Any]:
+    def get_metrics(self) -> dict[str, Any]:
         return {
             **super().get_metrics(),
             "chain": [a.name for a in self._advisors],
@@ -279,7 +278,7 @@ class RuleBasedAdvisor(BaseAdvisor):
         confidence_threshold: float = 0.5,
         max_parse_errors: int = 3,
         no_progress_after_steps: int = 15,
-        **kwargs,
+        **kwargs: Any,
     ):
         super().__init__(**kwargs)
         self.confidence_threshold = confidence_threshold
@@ -304,7 +303,7 @@ class RuleBasedAdvisor(BaseAdvisor):
         steps = getattr(context, 'steps_taken', 0)
         hyps = getattr(context, 'hypotheses', [])
 
-        parts: List[str] = []
+        parts: list[str] = []
         adj = None
 
         if conf is not None and conf < self.confidence_threshold:

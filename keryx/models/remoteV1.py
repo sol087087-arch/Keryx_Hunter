@@ -8,14 +8,16 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
 import threading
 import time
+from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any
 
 import httpx
 
@@ -26,16 +28,16 @@ except ImportError:
     _TIKTOKEN_AVAILABLE = False
 
 from .interface import (
-    ModelCapabilities,
-    ModelInterface,
-    GenerationConfig,
-    GenerationResult,
-    ToolDefinition,
-    ToolCall,
-    CostEstimate,
-    ModelError,
     BudgetExceededError,
     ContextOverflowError,
+    CostEstimate,
+    GenerationConfig,
+    GenerationResult,
+    ModelCapabilities,
+    ModelError,
+    ModelInterface,
+    ToolCall,
+    ToolDefinition,
 )
 
 logger = logging.getLogger("keryx.models.remote")
@@ -45,7 +47,7 @@ logger = logging.getLogger("keryx.models.remote")
 # Per-provider context lengths and costs (per 1k tokens)
 # ---------------------------------------------------------------------------
 
-_PROVIDER_MODELS: Dict[str, Dict[str, Any]] = {
+_PROVIDER_MODELS: dict[str, dict[str, Any]] = {
     # Anthropic
     "claude-opus-4.6":           {"ctx": 200_000, "in": 15.00,  "out": 75.00},
     "claude-sonnet-4.6":         {"ctx": 200_000, "in":  3.00,  "out": 15.00},
@@ -76,10 +78,10 @@ class RemoteModelConfig:
     provider:    str              # anthropic | openai | groq | deepseek
     api_key:     str
     model_name:  str
-    base_url:    Optional[str]   = None
+    base_url:    str | None   = None
     max_retries: int             = 3
     timeout:     float           = 60.0
-    max_budget_usd: Optional[float] = None
+    max_budget_usd: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -158,8 +160,8 @@ class RemoteModel(ModelInterface):
             }
 
         # Background sync loop (FIX 2)
-        self._sync_loop:   Optional[asyncio.AbstractEventLoop] = None
-        self._sync_thread: Optional[threading.Thread]           = None
+        self._sync_loop:   asyncio.AbstractEventLoop | None = None
+        self._sync_thread: threading.Thread | None           = None
         self._loop_ready   = threading.Event()
 
         logger.info(
@@ -182,7 +184,7 @@ class RemoteModel(ModelInterface):
             except Exception:
                 return None
 
-    def tokenize(self, text: str) -> List[int]:
+    def tokenize(self, text: str) -> list[int]:
         """FIX 6: mandatory abstract method."""
         if self._tokenizer:
             return self._tokenizer.encode(text)
@@ -196,12 +198,11 @@ class RemoteModel(ModelInterface):
     # ------------------------------------------------------------------
 
     def _check_budget(self, estimated_cost: float = 0.0) -> None:
-        if self.config.max_budget_usd is not None:
-            if self._session_cost_usd + estimated_cost > self.config.max_budget_usd:
-                raise BudgetExceededError(
-                    f"Budget ${self.config.max_budget_usd:.2f} would be exceeded "
-                    f"(used: ${self._session_cost_usd:.4f}, est: ${estimated_cost:.4f})"
-                )
+        if self.config.max_budget_usd is not None and self._session_cost_usd + estimated_cost > self.config.max_budget_usd:
+            raise BudgetExceededError(
+                f"Budget ${self.config.max_budget_usd:.2f} would be exceeded "
+                f"(used: ${self._session_cost_usd:.4f}, est: ${estimated_cost:.4f})"
+            )
 
     def _update_cost(self, input_t: int, output_t: int) -> None:
         cost = (
@@ -220,10 +221,10 @@ class RemoteModel(ModelInterface):
     async def generate_async(
         self,
         prompt:     str,
-        config:     Optional[GenerationConfig] = None,
+        config:     GenerationConfig | None = None,
         *,
-        grammar:    Optional[str] = None,    # GBNF — silently ignored for cloud
-        max_tokens: Optional[int] = None,
+        grammar:    str | None = None,    # GBNF — silently ignored for cloud
+        max_tokens: int | None = None,
     ) -> str:
         """
         FIX 4+5: returns str (not GenerationResult) to match agent.py expectations.
@@ -253,7 +254,7 @@ class RemoteModel(ModelInterface):
         self._check_budget(estimated)
         self._call_count += 1
 
-        last_error: Optional[Exception] = None
+        last_error: Exception | None = None
         for attempt in range(self.config.max_retries + 1):
             try:
                 if self.config.provider == "anthropic":
@@ -318,10 +319,10 @@ class RemoteModel(ModelInterface):
     def generate(
         self,
         prompt:     str,
-        config:     Optional[GenerationConfig] = None,
+        config:     GenerationConfig | None = None,
         *,
-        grammar:    Optional[str] = None,
-        max_tokens: Optional[int] = None,
+        grammar:    str | None = None,
+        max_tokens: int | None = None,
     ) -> str:
         """Sync wrapper — safe from any thread context."""
         loop   = self._ensure_sync_loop()
@@ -334,7 +335,7 @@ class RemoteModel(ModelInterface):
     def generate_result(
         self,
         prompt: str,
-        config: Optional[GenerationConfig] = None,
+        config: GenerationConfig | None = None,
     ) -> GenerationResult:
         """Returns full GenerationResult with token counts for budget tracking."""
         start = time.time()
@@ -349,7 +350,7 @@ class RemoteModel(ModelInterface):
     def generate_stream(
         self,
         prompt: str,
-        config: Optional[GenerationConfig] = None,
+        config: GenerationConfig | None = None,
     ) -> Iterator[str]:
         """Sync streaming — yields full response as single chunk (no true streaming for remote)."""
         yield self.generate(prompt, config)
@@ -361,9 +362,9 @@ class RemoteModel(ModelInterface):
     async def generate_with_tools(
         self,
         prompt: str,
-        tools:  List[ToolDefinition],
-        config: Optional[GenerationConfig] = None,
-    ) -> Union[str, ToolCall]:
+        tools:  list[ToolDefinition],
+        config: GenerationConfig | None = None,
+    ) -> str | ToolCall:
         cfg      = config or GenerationConfig()
         scrubbed = _scrub(prompt)
         self._check_budget()
@@ -375,9 +376,9 @@ class RemoteModel(ModelInterface):
     async def _generate_with_tools_anthropic(
         self,
         prompt: str,
-        tools:  List[ToolDefinition],
+        tools:  list[ToolDefinition],
         cfg:    GenerationConfig,
-    ) -> Union[str, ToolCall]:
+    ) -> str | ToolCall:
         anth_tools = [
             {
                 "name":        t["name"],
@@ -413,9 +414,9 @@ class RemoteModel(ModelInterface):
     async def _generate_with_tools_openai(
         self,
         prompt: str,
-        tools:  List[ToolDefinition],
+        tools:  list[ToolDefinition],
         cfg:    GenerationConfig,
-    ) -> Union[str, ToolCall]:
+    ) -> str | ToolCall:
         payload = {
             "model":       self.model_name,
             "max_tokens":  cfg.max_tokens,
@@ -447,7 +448,7 @@ class RemoteModel(ModelInterface):
     # Payload builders
     # ------------------------------------------------------------------
 
-    def _build_anthropic_payload(self, prompt: str, cfg: GenerationConfig) -> Dict:
+    def _build_anthropic_payload(self, prompt: str, cfg: GenerationConfig) -> dict:
         return {
             "model":       self.model_name,
             "max_tokens":  cfg.max_tokens,
@@ -455,7 +456,7 @@ class RemoteModel(ModelInterface):
             "messages":    [{"role": "user", "content": prompt}],
         }
 
-    def _build_openai_payload(self, prompt: str, cfg: GenerationConfig) -> Dict:
+    def _build_openai_payload(self, prompt: str, cfg: GenerationConfig) -> dict:
         return {
             "model":       self.model_name,
             "max_tokens":  cfg.max_tokens,
@@ -463,7 +464,7 @@ class RemoteModel(ModelInterface):
             "messages":    [{"role": "user", "content": prompt}],
         }
 
-    def _parse_response(self, data: Dict) -> Tuple[str, int, int]:
+    def _parse_response(self, data: dict) -> tuple[str, int, int]:
         if self.config.provider == "anthropic":
             text    = data["content"][0]["text"]
             input_t = data["usage"]["input_tokens"]
@@ -523,7 +524,7 @@ class RemoteModel(ModelInterface):
     # Metrics and lifecycle
     # ------------------------------------------------------------------
 
-    def get_metrics(self) -> Dict[str, Any]:
+    def get_metrics(self) -> dict[str, Any]:
         return {
             "provider":         self.config.provider,
             "model":            self.model_name,
@@ -544,10 +545,8 @@ class RemoteModel(ModelInterface):
             future = asyncio.run_coroutine_threadsafe(
                 self._client.aclose(), self._sync_loop
             )
-            try:
+            with contextlib.suppress(Exception):
                 future.result(timeout=5.0)
-            except Exception:
-                pass
         if self._sync_loop and not self._sync_loop.is_closed():
             self._sync_loop.call_soon_threadsafe(self._sync_loop.stop)
 
@@ -574,7 +573,7 @@ class RemoteModel(ModelInterface):
 def create_anthropic_model(
     api_key:        str,
     model:          str            = "claude-sonnet-4.6",
-    max_budget_usd: Optional[float] = None,
+    max_budget_usd: float | None = None,
 ) -> RemoteModel:
     spec = _PROVIDER_MODELS.get(model, {"ctx": 200_000, "in": 3.0, "out": 15.0})
     cfg  = RemoteModelConfig(
@@ -592,7 +591,7 @@ def create_anthropic_model(
 def create_openai_model(
     api_key:        str,
     model:          str            = "gpt-5.4",
-    max_budget_usd: Optional[float] = None,
+    max_budget_usd: float | None = None,
 ) -> RemoteModel:
     spec = _PROVIDER_MODELS.get(model, {"ctx": 128_000, "in": 2.5, "out": 10.0})
     cfg  = RemoteModelConfig(
@@ -610,7 +609,7 @@ def create_openai_model(
 def create_groq_model(
     api_key:        str,
     model:          str            = "llama-4-70b-versatile",
-    max_budget_usd: Optional[float] = None,
+    max_budget_usd: float | None = None,
 ) -> RemoteModel:
     spec = _PROVIDER_MODELS.get(model, {"ctx": 32_768, "in": 0.59, "out": 0.79})
     cfg  = RemoteModelConfig(
@@ -629,7 +628,7 @@ def create_groq_model(
 def create_deepseek_model(
     api_key:        str,
     model:          str            = "deepseek-v4",
-    max_budget_usd: Optional[float] = None,
+    max_budget_usd: float | None = None,
 ) -> RemoteModel:
     spec = _PROVIDER_MODELS.get(model, {"ctx": 64_000, "in": 0.14, "out": 0.28})
     cfg  = RemoteModelConfig(

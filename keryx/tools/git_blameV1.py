@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import math
 import os
@@ -16,20 +17,18 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from pydantic import ValidationError
 
 from ..core.schemas import GitBlameInput, HotspotEntry, MetricsSnapshot, RiskLevel
-from .toolbox import ToolResult, BaseTool
+from .Toolbox import BaseTool, ToolResult
 
 logger = logging.getLogger("keryx.tools.git_blame")
 
 # Rich is optional — used for human-readable operator output when available.
 try:
     from rich.console import Console
-    from rich.table import Table
-    from rich.text import Text
     _RICH_AVAILABLE = True
 except ImportError:
     _RICH_AVAILABLE = False
@@ -74,7 +73,7 @@ class GitBlameTool(BaseTool):
 
     def __init__(
         self,
-        git_path:         Optional[str] = None,
+        git_path:         str | None = None,
         timeout_seconds:  float         = 30.0,
         max_output_lines: int           = 200,
         enable_scrubbing: bool          = True,
@@ -94,7 +93,7 @@ class GitBlameTool(BaseTool):
         self.enable_scrubbing = enable_scrubbing
 
         # Rich console on stderr, only when stderr is a TTY and rich_output=True.
-        self._console: Optional[Any] = None
+        self._console: Any | None = None
         if rich_output and _RICH_AVAILABLE and sys.stderr.isatty():
             self._console = Console(stderr=True, highlight=False, soft_wrap=True)
 
@@ -166,7 +165,7 @@ class GitBlameTool(BaseTool):
             else:
                 result = await self._git_log(params)
 
-        except asyncio.TimeoutError:
+        except TimeoutError:
             duration_ms = (time.time() - start) * 1000
             self._record_call(success=False, duration_ms=duration_ms)
             logger.error("[GitBlameTool] %s timed out after %.0fs", params.command, self.timeout)
@@ -376,7 +375,7 @@ class GitBlameTool(BaseTool):
                 },
             )
 
-        except asyncio.TimeoutError:
+        except TimeoutError:
             duration_ms = (time.time() - start) * 1000
             self._record_call(success=False, duration_ms=duration_ms)
             logger.error("[GitBlameTool] Hotspots timed out after %.0fs", self.timeout)
@@ -402,7 +401,7 @@ class GitBlameTool(BaseTool):
     async def _run_cmd(
         self,
         cmd:             list[str],
-        extract_authors: Optional[str] = None,
+        extract_authors: str | None = None,
     ) -> _GitResult:
         """
         Run a git command with timeout. Kill on timeout.
@@ -415,7 +414,7 @@ class GitBlameTool(BaseTool):
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=self.timeout
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             _kill_proc(proc)
             raise
 
@@ -454,7 +453,7 @@ class GitBlameTool(BaseTool):
 
         # Local import to satisfy strict type checkers when rich is available.
         from rich.table import Table  # noqa: PLC0415
-        from rich.text  import Text   # noqa: PLC0415
+        from rich.text import Text  # noqa: PLC0415
 
         _RISK_STYLE = {
             RiskLevel.CRITICAL: "bold red",
@@ -590,10 +589,8 @@ def _kill_proc(proc: asyncio.subprocess.Process) -> None:
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
     except (ProcessLookupError, OSError):
-        try:
+        with contextlib.suppress(Exception):
             proc.kill()
-        except Exception:
-            pass
 
 
 # ---------------------------------------------------------------------------
@@ -601,7 +598,7 @@ def _kill_proc(proc: asyncio.subprocess.Process) -> None:
 # ---------------------------------------------------------------------------
 
 def create_git_blame_tool(
-    git_path:        Optional[str] = None,
+    git_path:        str | None = None,
     timeout_seconds: float         = 30.0,
     **kwargs: Any,
 ) -> GitBlameTool:
@@ -614,7 +611,7 @@ def create_git_blame_tool(
 
 async def get_file_blame(
     file_path: str,
-    line:      Optional[int] = None,
+    line:      int | None = None,
 ) -> dict[str, Any]:
     tool   = create_git_blame_tool()
     result = await tool.execute({"command": "blame", "file": file_path, "line": line})
@@ -628,10 +625,10 @@ async def get_file_blame(
 
 async def get_commit_log(
     n:      int           = 10,
-    path:   Optional[str] = None,
-    author: Optional[str] = None,
-    grep:   Optional[str] = None,
-    since:  Optional[str] = None,
+    path:   str | None = None,
+    author: str | None = None,
+    grep:   str | None = None,
+    since:  str | None = None,
 ) -> dict[str, Any]:
     tool   = create_git_blame_tool()
     result = await tool.execute({
@@ -650,8 +647,8 @@ async def get_commit_log(
 async def get_hotspots(
     path:       str           = ".",
     n_commits:  int           = 100,
-    since:      Optional[str] = None,
-    extensions: Optional[list[str]] = None,
+    since:      str | None = None,
+    extensions: list[str] | None = None,
 ) -> dict[str, Any]:
     tool   = create_git_blame_tool()
     result = await tool.execute({

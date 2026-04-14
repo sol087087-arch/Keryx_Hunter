@@ -4,13 +4,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import threading
 import time
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from typing import Any
 
 logger = logging.getLogger("keryx.tools")
 
@@ -33,9 +34,9 @@ class ToolResult:
     """
     success:  bool
     output:   str
-    error:    Optional[str]  = None
-    data:     Dict[str, Any] = field(default_factory=dict)
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    error:    str | None  = None
+    data:     dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def format_for_llm(self, max_chars: int = 1000) -> str:
         """Format for agent prompt — structured summary with finding counts."""
@@ -67,7 +68,7 @@ class ToolResult:
         """
         return self.format_for_llm(max_chars=500)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "success":  self.success,
             "output":   self.output[:2000],
@@ -105,13 +106,13 @@ class BaseTool:
 
     async def execute(
         self,
-        action_input: Dict[str, Any],
+        action_input: dict[str, Any],
         context: Any = None,
         # FIX 3: no timeout param — ToolBox applies wait_for externally
     ) -> ToolResult:
         raise NotImplementedError
 
-    def get_command(self, action_input: Dict[str, Any]) -> Optional[List[str]]:
+    def get_command(self, action_input: dict[str, Any]) -> list[str] | None:
         """Return subprocess command, or None for Python-native tools."""
         return None
 
@@ -131,7 +132,7 @@ class BaseTool:
             self._success_count = 0
             self._total_time_ms = 0.0
 
-    def get_metrics(self) -> Dict[str, Any]:
+    def get_metrics(self) -> dict[str, Any]:
         with self._lock:
             return {
                 "name":         self.name,
@@ -159,7 +160,7 @@ class ToolBox:
     """
 
     def __init__(self, default_timeout: float = 60.0) -> None:
-        self._tools:           Dict[str, BaseTool] = {}
+        self._tools:           dict[str, BaseTool] = {}
         self.default_timeout   = default_timeout
 
         # FIX 7: CPU*4 causes OOM for CPU-bound tools. Cap at reasonable default.
@@ -177,8 +178,8 @@ class ToolBox:
         logger.info(f"[ToolBox] Initialized | workers={max_workers} (CPU={cpu_count})")
 
         # Persistent background loop for sync bridge
-        self._sync_loop:   Optional[asyncio.AbstractEventLoop] = None
-        self._sync_thread: Optional[threading.Thread]          = None
+        self._sync_loop:   asyncio.AbstractEventLoop | None = None
+        self._sync_thread: threading.Thread | None          = None
         self._loop_lock    = threading.Lock()
         self._loop_ready   = threading.Event()
 
@@ -195,17 +196,17 @@ class ToolBox:
         self._tools[tool.name] = tool
         logger.info(f"[ToolBox] Registered: {tool.name!r}")
 
-    def register_many(self, tools: List[BaseTool]) -> None:
+    def register_many(self, tools: list[BaseTool]) -> None:
         for tool in tools:
             self.register(tool)
 
-    def list_tools(self) -> List[str]:
+    def list_tools(self) -> list[str]:
         return [n for n, t in self._tools.items() if t.is_available()]
 
-    def get_tool(self, name: str) -> Optional[BaseTool]:
+    def get_tool(self, name: str) -> BaseTool | None:
         return self._tools.get(name)
 
-    def get_command(self, action: str, action_input: Dict[str, Any]) -> Optional[List[str]]:
+    def get_command(self, action: str, action_input: dict[str, Any]) -> list[str] | None:
         tool = self._tools.get(action)
         return tool.get_command(action_input) if tool and tool.is_available() else None
 
@@ -216,9 +217,9 @@ class ToolBox:
     async def execute_async(
         self,
         action:       str,
-        action_input: Dict[str, Any],
+        action_input: dict[str, Any],
         context:      Any            = None,
-        timeout:      Optional[float] = None,
+        timeout:      float | None = None,
     ) -> ToolResult:
         start = time.time()
 
@@ -274,7 +275,7 @@ class ToolBox:
             })
             return result
 
-        except asyncio.TimeoutError:
+        except TimeoutError:
             duration_ms = (time.time() - start) * 1000
             tool._record_call(False, duration_ms)
             self._total_calls  += 1
@@ -331,9 +332,9 @@ class ToolBox:
     def execute(
         self,
         action:       str,
-        action_input: Dict[str, Any],
+        action_input: dict[str, Any],
         context:      Any            = None,
-        timeout:      Optional[float] = None,
+        timeout:      float | None = None,
     ) -> ToolResult:
         """
         Synchronous dispatch — returns ToolResult.
@@ -377,10 +378,10 @@ class ToolBox:
 
     async def execute_batch(
         self,
-        actions:        List[tuple],
+        actions:        list[tuple],
         context:        Any          = None,
         max_concurrent: int          = 4,
-    ) -> List[ToolResult]:
+    ) -> list[ToolResult]:
         """
         Execute multiple tools with semaphore-controlled concurrency.
         Each tool's execute() already catches all errors and returns ToolResult,
@@ -388,7 +389,7 @@ class ToolBox:
         """
         semaphore = asyncio.Semaphore(max_concurrent)
 
-        async def run(action: str, action_input: Dict) -> ToolResult:
+        async def run(action: str, action_input: dict) -> ToolResult:
             async with semaphore:
                 return await self.execute_async(action, action_input, context)
 
@@ -397,7 +398,7 @@ class ToolBox:
             return_exceptions=True,
         )
 
-        out: List[ToolResult] = []
+        out: list[ToolResult] = []
         for i, r in enumerate(results):
             if isinstance(r, Exception):
                 out.append(ToolResult(
@@ -414,7 +415,7 @@ class ToolBox:
     # Metrics and lifecycle
     # ------------------------------------------------------------------
 
-    def get_metrics(self) -> Dict[str, Any]:
+    def get_metrics(self) -> dict[str, Any]:
         return {
             "total_calls":   self._total_calls,
             "timeouts":      self._timeout_count,
@@ -437,10 +438,8 @@ class ToolBox:
                 self._sync_loop.call_soon_threadsafe(self._sync_loop.stop)
                 if self._sync_thread and self._sync_thread.is_alive():
                     self._sync_thread.join(timeout=3.0)
-                try:
+                with contextlib.suppress(Exception):
                     self._sync_loop.close()
-                except Exception:
-                    pass
         logger.info("[ToolBox] Done")
 
     def __repr__(self) -> str:
@@ -452,7 +451,7 @@ class ToolBox:
 # ---------------------------------------------------------------------------
 
 def create_toolbox(
-    tools:           Optional[List[BaseTool]] = None,
+    tools:           list[BaseTool] | None = None,
     default_timeout: float                    = 60.0,
 ) -> ToolBox:
     tb = ToolBox(default_timeout=default_timeout)
@@ -464,15 +463,15 @@ def create_toolbox(
 # ---------------------------------------------------------------------------
 
 def create_default_toolbox(
-    allowed_root: Optional[str] = None,
+    allowed_root: str | None = None,
     default_timeout: float = 60.0,
 ) -> ToolBox:
     """
     Создаёт Toolbox со всеми инструментами, которые должны быть доступны агенту.
     Это точка сборки, которую использует orchestrator и agent.
     """
-    from .read_file import create_read_file_tool
     from .git_blame import create_git_blame_tool
+    from .read_file import create_read_file_tool
     # from .codeql import create_codeql_tool      # раскомментировать позже
     # from .gdb import create_gdb_tool
     # from .fuzzer import create_fuzzer_tool

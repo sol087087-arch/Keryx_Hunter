@@ -9,10 +9,10 @@ import hashlib
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set
+from typing import Any
 
-from .base import BaseAdvisor, AdvisorResponse
 from ..models.interface import ModelInterface
+from .base import AdvisorResponse, BaseAdvisor
 
 try:
     from ..core.shared_context import SharedContext
@@ -42,7 +42,7 @@ ws ::= [ \t\n\r]*
 _FALLBACK_TOOL_RULE = 'tool-array ::= "[" ws "]"\n'
 
 
-def build_dynamic_grammar(available_tools: List[str]) -> str:
+def build_dynamic_grammar(available_tools: list[str]) -> str:
     """
     Build GBNF with strict tool enumeration.
     Prevents model from hallucinating tool names that don't exist.
@@ -68,7 +68,7 @@ class ContextCacheKey:
     tool_outputs_hash: str
 
     @classmethod
-    def from_context(cls, context: Any, history_depth: int = 5) -> "ContextCacheKey":
+    def from_context(cls, context: Any, history_depth: int = 5) -> ContextCacheKey:
         steps = list(getattr(context, 'steps', []))[-history_depth:]
         step_parts = []
         for s in steps:
@@ -109,7 +109,7 @@ class LocalAdvisor(BaseAdvisor):
     def __init__(
         self,
         model: ModelInterface,
-        toolbox: Optional[Any] = None,
+        toolbox: Any | None = None,
         max_calls_per_session: int = 4,
         confidence_threshold: float = 0.55,
         max_parse_errors: int = 4,
@@ -132,9 +132,9 @@ class LocalAdvisor(BaseAdvisor):
         self.temperature = temperature
 
         # State
-        self._last_advice_hash: Optional[int] = None
-        self._suggested_dead_ends: Set[str] = set()
-        self._last_cache_key: Optional[ContextCacheKey] = None
+        self._last_advice_hash: int | None = None
+        self._suggested_dead_ends: set[str] = set()
+        self._last_cache_key: ContextCacheKey | None = None
 
         logger.info(
             f"[{self.name}] Initialized | model={model.model_name} | "
@@ -210,7 +210,7 @@ class LocalAdvisor(BaseAdvisor):
             )
             return response
 
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error(f"[{self.name}] Generation timeout")
             return self._fallback_response(context, "timeout")
         except Exception as exc:
@@ -220,7 +220,7 @@ class LocalAdvisor(BaseAdvisor):
     # ------------------------------------------------------------------
     # Tool resolution
     # ------------------------------------------------------------------
-    def _get_available_tools(self, context: Any) -> List[str]:
+    def _get_available_tools(self, context: Any) -> list[str]:
         if self.toolbox is not None and hasattr(self.toolbox, 'list_tools'):
             return self.toolbox.list_tools()
         if hasattr(context, 'get_available_tools'):
@@ -230,7 +230,7 @@ class LocalAdvisor(BaseAdvisor):
     # ------------------------------------------------------------------
     # Prompt
     # ------------------------------------------------------------------
-    def _build_prompt(self, context: Any, available_tools: List[str]) -> str:
+    def _build_prompt(self, context: Any, available_tools: list[str]) -> str:
         blacklisted_hyps = list(getattr(context, 'blacklisted_hypotheses', []))
         failed_tools = list(getattr(context, 'failed_tools', []))
         all_blacklisted = set(blacklisted_hyps) | self._suggested_dead_ends
@@ -312,7 +312,7 @@ class LocalAdvisor(BaseAdvisor):
         self,
         raw: str,
         context: Any,
-        available_tools: List[str],
+        available_tools: list[str],
     ) -> AdvisorResponse:
         raw = raw.strip()
 
@@ -357,7 +357,7 @@ class LocalAdvisor(BaseAdvisor):
             },
         )
 
-    def _clamp_threshold(self, value: Any) -> Optional[float]:
+    def _clamp_threshold(self, value: Any) -> float | None:
         if value is None:
             return None
         try:
@@ -410,7 +410,7 @@ class LocalAdvisor(BaseAdvisor):
         self._suggested_dead_ends = set()
         self._last_cache_key = None
 
-    def get_metrics(self) -> Dict[str, Any]:
+    def get_metrics(self) -> dict[str, Any]:
         return {
             **super().get_metrics(),
             "model": self.model.model_name,
@@ -427,7 +427,7 @@ class LocalAdvisor(BaseAdvisor):
 # ---------------------------------------------------------------------------
 def create_local_advisor(
     model: ModelInterface,
-    toolbox: Optional[Any] = None,
+    toolbox: Any | None = None,
     **kwargs,
 ) -> LocalAdvisor:
     return LocalAdvisor(model=model, toolbox=toolbox, **kwargs)

@@ -4,12 +4,13 @@
 # Sovereign, air-gapped aware, cascade-advisor aware.
 
 import logging
-import yaml
 from pathlib import Path
-from typing import Dict, Any, Optional, List, TypedDict
+from typing import Any, TypedDict, cast
 
-from ..models.interface import ModelInterface
+import yaml  # type: ignore[import-untyped]
+
 from ..advisors.manager import AdvisorManager
+from ..models.interface import ModelInterface
 
 logger = logging.getLogger("keryx.router")
 
@@ -24,7 +25,7 @@ class ModelCapability(TypedDict):
     requires_gpu: bool
 
 
-_CAPABILITY_TIERS: Dict[str, ModelCapability] = {
+_CAPABILITY_TIERS: dict[str, ModelCapability] = {
     "llama-4-70b": {"tier": 100, "is_local": True, "context_length": 32768, "requires_gpu": True},
     "qwen3.5-coder-32b": {"tier": 95, "is_local": True, "context_length": 131072, "requires_gpu": True},
     "deepseek-r1": {"tier": 90, "is_local": False, "context_length": 16384, "requires_gpu": False},
@@ -36,12 +37,13 @@ _CAPABILITY_TIERS: Dict[str, ModelCapability] = {
 
 
 # Pre-computed fallback chains (module level)
-def _build_fallback_chain(model_name: str) -> List[str]:
+def _build_fallback_chain(model_name: str) -> list[str]:
     """
     Return fallback candidates ordered by capability tier (descending),
     excluding the requested model itself.
     """
-    requested_tier = _CAPABILITY_TIERS.get(model_name, {}).get("tier", 0)
+    _fallback: ModelCapability = cast(ModelCapability, {"tier": 0, "is_local": True, "context_length": 0, "requires_gpu": False})
+    requested_tier = _CAPABILITY_TIERS.get(model_name, _fallback)["tier"]
     return [
         name
         for name, specs in sorted(
@@ -51,7 +53,7 @@ def _build_fallback_chain(model_name: str) -> List[str]:
     ]
 
 
-_FALLBACK_CHAINS: Dict[str, List[str]] = {
+_FALLBACK_CHAINS: dict[str, list[str]] = {
     name: _build_fallback_chain(name) for name in _CAPABILITY_TIERS
 }
 
@@ -69,13 +71,13 @@ class RoutingPlan:
         self,
         executor_model: ModelInterface,
         advisor_name: str,
-        advisor_chain: List[str],
-        budget_usd: Optional[float],
+        advisor_chain: list[str],
+        budget_usd: float | None,
         enforce_no_network: bool,
         require_consensus: bool,
         consensus_threshold: float,
         require_fuzzing_confirm: bool,
-        debate_models: List[str],
+        debate_models: list[str],
         capability: str,
     ):
         self.executor_model = executor_model
@@ -117,7 +119,7 @@ class RoutingPlan:
 # ---------------------------------------------------------------------------
 # Default capability profiles
 # ---------------------------------------------------------------------------
-_DEFAULTS: Dict[str, Dict[str, Any]] = {
+_DEFAULTS: dict[str, dict[str, Any]] = {
     "fast_pattern_matching": {
         "executor": "qwen3-coder-8b",
         "advisor": "none",
@@ -167,19 +169,19 @@ class CapabilityRouter:
 
     def __init__(
         self,
-        config_path: Optional[Path] = None,
+        config_path: Path | None = None,
         has_gpu: bool = False,
     ):
         self.config_path = config_path or Path.home() / ".keryx" / "capabilities.yaml"
         self.capabilities = self._load_capabilities()
         self._has_gpu = has_gpu
-        self.metrics: Dict[str, int] = dict.fromkeys(_METRIC_KEYS, 0)
+        self.metrics: dict[str, int] = dict.fromkeys(_METRIC_KEYS, 0)
 
         logger.info(
             f"[Router] Loaded {len(self.capabilities)} capability profiles | gpu={has_gpu}"
         )
 
-    def get_metrics(self) -> Dict[str, int]:
+    def get_metrics(self) -> dict[str, int]:
         return self.metrics.copy()
 
     def reset_metrics(self) -> None:
@@ -191,10 +193,10 @@ class CapabilityRouter:
     def route(
         self,
         capability: str,
-        available_models: Dict[str, ModelInterface],
+        available_models: dict[str, ModelInterface],
         advisor_manager: AdvisorManager,
         is_airgapped: bool = False,
-        user_budget_usd: Optional[float] = None,
+        user_budget_usd: float | None = None,
     ) -> RoutingPlan:
         self.metrics["routing_decisions"] += 1
 
@@ -254,7 +256,7 @@ class CapabilityRouter:
     def _resolve_executor(
         self,
         requested: str,
-        available: Dict[str, ModelInterface],
+        available: dict[str, ModelInterface],
         is_airgapped: bool,
     ) -> ModelInterface:
         candidates = [requested] + _FALLBACK_CHAINS.get(requested, [])
@@ -264,7 +266,8 @@ class CapabilityRouter:
                 continue
 
             model = available[name]
-            caps = _CAPABILITY_TIERS.get(name, {})
+            _fallback_cap: ModelCapability = cast(ModelCapability, {"tier": 0, "is_local": False, "context_length": 0, "requires_gpu": False})
+            caps: ModelCapability = _CAPABILITY_TIERS.get(name, _fallback_cap)
 
             if caps.get("requires_gpu", False) and not self._has_gpu:
                 logger.warning(f"Skipping '{name}' — requires GPU")
@@ -292,10 +295,10 @@ class CapabilityRouter:
 
     def _resolve_advisor(
         self,
-        cfg: Dict[str, Any],
+        cfg: dict[str, Any],
         advisor_manager: AdvisorManager,
         is_airgapped: bool,
-    ) -> tuple[str, List[str]]:
+    ) -> tuple[str, list[str]]:
         requested = cfg.get("advisor", "none")
         fallback = cfg.get("fallback_advisor")
         chain = list(cfg.get("advisor_chain", []))
@@ -303,7 +306,7 @@ class CapabilityRouter:
         if requested == "none":
             return "none", []
 
-        def _try(name: Optional[str]) -> Optional[str]:
+        def _try(name: str | None) -> str | None:
             if not name:
                 return None
             advisor = advisor_manager.get_advisor(name)
@@ -342,10 +345,10 @@ class CapabilityRouter:
 
     @staticmethod
     def _resolve_budget(
-        profile_budget: Optional[float],
-        user_budget: Optional[float],
+        profile_budget: float | None,
+        user_budget: float | None,
         enforce_no_network: bool,
-    ) -> Optional[float]:
+    ) -> float | None:
         if enforce_no_network:
             return None
         if user_budget is not None and profile_budget is not None:
@@ -355,7 +358,7 @@ class CapabilityRouter:
     # ------------------------------------------------------------------
     # Config loading
     # ------------------------------------------------------------------
-    def _load_capabilities(self) -> Dict[str, Dict[str, Any]]:
+    def _load_capabilities(self) -> dict[str, dict[str, Any]]:
         merged = {k: v.copy() for k, v in _DEFAULTS.items()}
 
         if not self.config_path.exists():
@@ -381,7 +384,7 @@ class CapabilityRouter:
     # ------------------------------------------------------------------
     # CLI helpers
     # ------------------------------------------------------------------
-    def list_capabilities(self) -> List[str]:
+    def list_capabilities(self) -> list[str]:
         return sorted(self.capabilities.keys())
 
     def describe(self, capability: str) -> str:
@@ -397,7 +400,7 @@ class CapabilityRouter:
 # Convenience factory
 # ---------------------------------------------------------------------------
 def create_router(
-    config_path: Optional[Path] = None,
+    config_path: Path | None = None,
     has_gpu: bool = False,
 ) -> CapabilityRouter:
     return CapabilityRouter(config_path, has_gpu)

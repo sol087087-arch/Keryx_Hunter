@@ -7,9 +7,9 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
-from .toolbox import BaseTool, ToolResult
+from .Toolbox import BaseTool, ToolResult
 
 logger = logging.getLogger("keryx.tools.read_file")
 
@@ -29,9 +29,9 @@ class ReadFileTool(BaseTool):
     def __init__(
         self,
         max_chars: int = 100_000,
-        max_lines: Optional[int] = None,
+        max_lines: int | None = None,
         encoding: str = "utf-8",
-        allowed_root: Optional[str] = None,
+        allowed_root: str | None = None,
         timeout_seconds: float = 10.0,
     ):
         super().__init__()
@@ -48,7 +48,7 @@ class ReadFileTool(BaseTool):
 
     async def execute(
         self,
-        action_input: Dict[str, Any],
+        action_input: dict[str, Any],
         context: Any = None,
     ) -> ToolResult:
         file_path = action_input.get("file_path") or action_input.get("path")
@@ -101,7 +101,7 @@ class ReadFileTool(BaseTool):
                     loop.run_in_executor(None, self._read_file, path, encoding, max_chars),
                     timeout=self.timeout,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.error(f"ReadFileTool timeout on {file_path} after {self.timeout}s")
                 return ToolResult(
                     success=False,
@@ -165,10 +165,10 @@ class ReadFileTool(BaseTool):
         """
         read_limit = max_chars + 2000  # небольшой запас для корректного line truncation
 
-        with open(path, mode="r", encoding=encoding, errors="replace") as f:
+        with open(path, encoding=encoding, errors="replace") as f:
             return f.read(read_limit)
 
-    def get_command(self, action_input: Dict[str, Any]) -> Optional[list]:
+    def get_command(self, action_input: dict[str, Any]) -> list | None:
         """No subprocess command — pure Python tool."""
         return None
 
@@ -184,9 +184,9 @@ class ReadFileTool(BaseTool):
 # ---------------------------------------------------------------------------
 def create_read_file_tool(
     max_chars: int = 100_000,
-    max_lines: Optional[int] = None,
+    max_lines: int | None = None,
     encoding: str = "utf-8",
-    allowed_root: Optional[str] = None,
+    allowed_root: str | None = None,
     timeout_seconds: float = 10.0,
 ) -> ReadFileTool:
     """Factory function for ReadFileTool."""

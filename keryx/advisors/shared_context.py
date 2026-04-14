@@ -8,9 +8,9 @@ import hashlib
 import json
 import logging
 import time
-from collections import deque, defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any
 
 logger = logging.getLogger("keryx.context")
 
@@ -22,16 +22,16 @@ logger = logging.getLogger("keryx.context")
 class ContextStep:
     step_num: int
     action: str
-    action_input: Dict[str, Any]
+    action_input: dict[str, Any]
     observation: str
     thought: str = ""
     confidence: float = 0.0
     timestamp: float = field(default_factory=time.time)
-    needs_evidence: Optional[str] = None
+    needs_evidence: str | None = None
     is_essential: bool = False
     error_count: int = 0
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "step_num": self.step_num,
             "action": self.action,
@@ -46,7 +46,7 @@ class ContextStep:
         }
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "ContextStep":
+    def from_dict(cls, d: dict[str, Any]) -> ContextStep:
         return cls(
             step_num=d["step_num"],
             action=d["action"],
@@ -120,36 +120,36 @@ class SharedContext:
         # Scan state
         self.steps_taken: int = 0
         self.parse_errors: int = 0
-        self.scanned_files: Set[str] = set()
-        self.hypotheses: List[str] = []
-        self.confirmed_vulns: List[Dict] = []
-        self.blacklisted_hypotheses: List[str] = []
-        self.failed_tools: List[str] = []
+        self.scanned_files: set[str] = set()
+        self.hypotheses: list[str] = []
+        self.confirmed_vulns: list[dict] = []
+        self.blacklisted_hypotheses: list[str] = []
+        self.failed_tools: list[str] = []
         self.escalation_level: int = 1
 
         # Cost tracking
         self.session_cost_usd: float = 0.0
-        self._cost_by_file: Dict[str, float] = defaultdict(float)
+        self._cost_by_file: dict[str, float] = defaultdict(float)
 
         # History
         self._steps: deque = deque(maxlen=max_history_steps)
         self._critiques: deque = deque(maxlen=max_critiques)
 
         # Per-action failure counters
-        self._action_failure_counts: Dict[str, int] = defaultdict(int)
+        self._action_failure_counts: dict[str, int] = defaultdict(int)
         self._stupid_loop_detected: bool = False
 
         # Evidence memory
-        self._evidence_map: Dict[str, str] = {}
-        self._evidence_index: Dict[str, List[str]] = defaultdict(list)
+        self._evidence_map: dict[str, str] = {}
+        self._evidence_index: dict[str, list[str]] = defaultdict(list)
 
         # Advisor state
-        self._pending_advisor_advice: Optional[Any] = None
+        self._pending_advisor_advice: Any | None = None
         self._advisor_guidance: str = ""
 
         # Deduplication sets
-        self._hypothesis_set: Set[str] = set()
-        self._blacklist_set: Set[str] = set()
+        self._hypothesis_set: set[str] = set()
+        self._blacklist_set: set[str] = set()
 
         logger.info(f"[SharedContext] Initialized | target={target_path}")
 
@@ -223,7 +223,7 @@ class SharedContext:
     # ------------------------------------------------------------------
     # Cost tracking
     # ------------------------------------------------------------------
-    def add_cost(self, cost_usd: float, file_path: Optional[str] = None) -> None:
+    def add_cost(self, cost_usd: float, file_path: str | None = None) -> None:
         self.session_cost_usd += cost_usd
         target = file_path
         if target is None and self._steps:
@@ -234,8 +234,8 @@ class SharedContext:
             self._cost_by_file[target] += cost_usd
 
     def should_escalate_by_cost(
-        self, threshold: Optional[float] = None
-    ) -> Tuple[bool, str]:
+        self, threshold: float | None = None
+    ) -> tuple[bool, str]:
         thr = threshold or self._cost_threshold
         confirmed_observations = {
             v.get("observation", "")[:50] for v in self.confirmed_vulns
@@ -252,7 +252,7 @@ class SharedContext:
 
         return False, ""
 
-    def get_expensive_files(self, min_cost: float = 1.0) -> List[Tuple[str, float]]:
+    def get_expensive_files(self, min_cost: float = 1.0) -> list[tuple[str, float]]:
         return sorted(
             [(f, c) for f, c in self._cost_by_file.items() if c >= min_cost],
             key=lambda x: x[1], reverse=True,
@@ -265,20 +265,20 @@ class SharedContext:
         self,
         pointer: str,
         observation_fragment: str,
-        keywords: Optional[List[str]] = None,
+        keywords: list[str] | None = None,
     ) -> None:
         self._evidence_map[pointer] = observation_fragment
         kws = keywords or [w for w in observation_fragment.lower().split()[:3] if len(w) > 3]
         for kw in kws:
             self._evidence_index[kw].append(pointer)
 
-    def get_evidence(self, pointer: str) -> Optional[str]:
+    def get_evidence(self, pointer: str) -> str | None:
         return self._evidence_map.get(pointer)
 
-    def search_evidence(self, keyword: str) -> List[str]:
+    def search_evidence(self, keyword: str) -> list[str]:
         return self._evidence_index.get(keyword.lower(), [])
 
-    def get_evidence_summary(self) -> Dict[str, int]:
+    def get_evidence_summary(self) -> dict[str, int]:
         return {
             "total_fragments": len(self._evidence_map),
             "indexed_keywords": len(self._evidence_index),
@@ -297,10 +297,10 @@ class SharedContext:
             parts.append(step.to_text(verbose=verbose))
         return "\n\n".join(parts)
 
-    def get_last_step(self) -> Optional[str]:
+    def get_last_step(self) -> str | None:
         return self._steps[-1].to_text() if self._steps else None
 
-    def get_last_confidence(self) -> Optional[float]:
+    def get_last_confidence(self) -> float | None:
         return self._steps[-1].confidence if self._steps else None
 
     def add_critique(self, critique: str) -> None:
@@ -342,7 +342,7 @@ class SharedContext:
         active = [h for h in self.hypotheses if h not in self._blacklist_set]
         if not active:
             return "None" if not self.blacklisted_hypotheses else "None (all blacklisted)"
-        seen: Set[str] = set()
+        seen: set[str] = set()
         unique = []
         for h in active:
             if h not in seen:
@@ -369,7 +369,7 @@ class SharedContext:
     def set_escalation_level(self, level: int) -> None:
         self.escalation_level = max(1, min(level, 4))
 
-    def add_confirmed_vuln(self, vuln: Dict[str, Any]) -> None:
+    def add_confirmed_vuln(self, vuln: dict[str, Any]) -> None:
         v = dict(vuln)
         v.setdefault("timestamp", time.time())
         self.confirmed_vulns.append(v)
@@ -389,15 +389,15 @@ class SharedContext:
     def has_pending_advisor_advice(self) -> bool:
         return self._pending_advisor_advice is not None
 
-    def peek_advisor_advice(self) -> Optional[Any]:
+    def peek_advisor_advice(self) -> Any | None:
         return self._pending_advisor_advice
 
-    def consume_advisor_advice(self) -> Optional[Any]:
+    def consume_advisor_advice(self) -> Any | None:
         advice = self._pending_advisor_advice
         self._pending_advisor_advice = None
         return advice
 
-    def get_pending_advisor_advice(self) -> Optional[Any]:
+    def get_pending_advisor_advice(self) -> Any | None:
         return self.consume_advisor_advice()
 
     def clear_pending_advisor_advice(self) -> None:
@@ -412,7 +412,7 @@ class SharedContext:
     # ------------------------------------------------------------------
     # Knowledge graph fragment
     # ------------------------------------------------------------------
-    def get_knowledge_graph_fragment(self) -> Dict[str, Any]:
+    def get_knowledge_graph_fragment(self) -> dict[str, Any]:
         escalate_by_cost, cost_reason = self.should_escalate_by_cost()
         return {
             "files_touched": list(self.scanned_files),
@@ -427,7 +427,7 @@ class SharedContext:
     # ------------------------------------------------------------------
     # Metrics and summary
     # ------------------------------------------------------------------
-    def get_metrics(self) -> Dict[str, Any]:
+    def get_metrics(self) -> dict[str, Any]:
         return {
             "steps_taken": self.steps_taken,
             "files_scanned": len(self.scanned_files),
@@ -478,7 +478,7 @@ class SharedContext:
     # ------------------------------------------------------------------
     # Serialization
     # ------------------------------------------------------------------
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         routing_dict = None
         if self.routing_plan and hasattr(self.routing_plan, 'capability'):
             routing_dict = {
@@ -511,7 +511,7 @@ class SharedContext:
         }
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "SharedContext":
+    def from_dict(cls, d: dict[str, Any]) -> SharedContext:
         ctx = cls(
             target_path=d["target_path"],
             capability=d.get("capability", "deep_reasoning"),

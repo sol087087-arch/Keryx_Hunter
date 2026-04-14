@@ -6,18 +6,11 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from enum import Enum, auto
 from typing import (
     Any,
-    AsyncIterator,
-    Callable,
-    Dict,
-    Iterator,
-    List,
-    Optional,
     TypedDict,
-    Union,
 )
 
 logger = logging.getLogger("keryx.models")
@@ -32,10 +25,10 @@ class GenerationConfig:
     min_p: float = 0.05
     top_k: int = 0
     repeat_penalty: float = 1.1
-    stop: Optional[List[str]] = None
-    grammar: Optional[str] = None
-    seed: Optional[int] = None
-    logits_post_processor: Optional[Callable] = field(default=None, repr=False)
+    stop: list[str] | None = None
+    grammar: str | None = None
+    seed: int | None = None
+    logits_post_processor: Callable | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -47,18 +40,18 @@ class GenerationResult:
     duration_ms: float
     time_to_first_token_ms: float = 0.0
     finish_reason: str = "stop"
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class ToolCall(TypedDict):
     name: str
-    arguments: Dict[str, Any]
+    arguments: dict[str, Any]
 
 
 class ToolDefinition(TypedDict):
     name: str
     description: str
-    parameters: Dict[str, Any]
+    parameters: dict[str, Any]
 
 
 class CostEstimate(TypedDict):
@@ -91,10 +84,10 @@ class ModelInterface(ABC):
     def generate(
         self,
         prompt: str,
-        config: Optional[GenerationConfig] = None,
+        config: GenerationConfig | None = None,
         *,
-        grammar: Optional[str] = None,
-        max_tokens: Optional[int] = None,
+        grammar: str | None = None,
+        max_tokens: int | None = None,
     ) -> str:
         pass
 
@@ -102,7 +95,7 @@ class ModelInterface(ABC):
     def generate_result(
         self,
         prompt: str,
-        config: Optional[GenerationConfig] = None,
+        config: GenerationConfig | None = None,
     ) -> GenerationResult:
         pass
 
@@ -110,7 +103,7 @@ class ModelInterface(ABC):
     def generate_stream(
         self,
         prompt: str,
-        config: Optional[GenerationConfig] = None,
+        config: GenerationConfig | None = None,
     ) -> Iterator[str]:
         pass
 
@@ -118,18 +111,18 @@ class ModelInterface(ABC):
     def generate_with_tools(
         self,
         prompt: str,
-        tools: List[ToolDefinition],
-        config: Optional[GenerationConfig] = None,
-    ) -> Union[str, ToolCall]:
+        tools: list[ToolDefinition],
+        config: GenerationConfig | None = None,
+    ) -> str | ToolCall:
         pass
 
     async def generate_async(
         self,
         prompt: str,
-        config: Optional[GenerationConfig] = None,
+        config: GenerationConfig | None = None,
         *,
-        grammar: Optional[str] = None,
-        max_tokens: Optional[int] = None,
+        grammar: str | None = None,
+        max_tokens: int | None = None,
     ) -> str:
         """Default async implementation via thread pool."""
         import asyncio
@@ -140,7 +133,7 @@ class ModelInterface(ABC):
         )
 
     @abstractmethod
-    def tokenize(self, text: str) -> List[int]:
+    def tokenize(self, text: str) -> list[int]:
         pass
 
     def count_tokens(self, text: str) -> int:
@@ -153,8 +146,8 @@ class ModelInterface(ABC):
     def get_context_used(self) -> int:
         return 0
 
-    def clear_context(self, keep_tokens: int = 0) -> None:
-        pass
+    def clear_context(self, keep_tokens: int = 0) -> None:  # noqa: B027
+        """No-op default — subclasses override if context windowing is supported."""
 
     @abstractmethod
     def is_healthy(self) -> bool:
@@ -168,8 +161,8 @@ class ModelInterface(ABC):
     def get_usage_cost(self) -> CostEstimate:
         pass
 
-    def reset_cost_tracking(self) -> None:
-        pass
+    def reset_cost_tracking(self) -> None:  # noqa: B027
+        """No-op default — subclasses override if cost accumulation is tracked."""
 
     @abstractmethod
     def get_capabilities(self) -> ModelCapabilities:
@@ -194,14 +187,14 @@ class ModelInterface(ABC):
     def requires_network(self) -> bool:
         return not self.is_local
 
-    async def load(self) -> None:
-        pass
+    async def load(self) -> None:  # noqa: B027
+        """No-op default — subclasses override for async model loading."""
 
     @abstractmethod
     def unload(self) -> None:
         pass
 
-    def get_metrics(self) -> Dict[str, Any]:
+    def get_metrics(self) -> dict[str, Any]:
         return {}
 
 

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import platform
@@ -14,8 +15,8 @@ import re
 import shutil
 import signal
 import time
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any
 
 # FIX 3: correct relative import path
 try:
@@ -23,7 +24,7 @@ try:
 except ImportError:
     SharedContext = Any  # type: ignore
 
-from .toolbox import BaseTool, ToolResult
+from .Toolbox import BaseTool, ToolResult
 
 logger = logging.getLogger("keryx.tools.gdb")
 
@@ -75,7 +76,7 @@ class GDBTool(BaseTool):   # FIX 1: inherit BaseTool
     )
     default_timeout = 45.0
 
-    PRESET_COMMANDS: Dict[str, str] = {
+    PRESET_COMMANDS: dict[str, str] = {
         "backtrace":      "bt full",
         "registers":      "info registers",
         "all_registers":  "info all-registers",
@@ -91,7 +92,7 @@ class GDBTool(BaseTool):   # FIX 1: inherit BaseTool
 
     def __init__(
         self,
-        gdb_path:         Optional[str] = None,
+        gdb_path:         str | None = None,
         timeout_seconds:  float         = 45.0,
         max_output_chars: int           = 50_000,
         enable_scrubbing: bool          = True,
@@ -119,7 +120,7 @@ class GDBTool(BaseTool):   # FIX 1: inherit BaseTool
 
     async def execute(
         self,
-        action_input: Dict[str, Any],
+        action_input: dict[str, Any],
         context: Any = None,
     ) -> ToolResult:
         if not self._available:
@@ -195,7 +196,7 @@ class GDBTool(BaseTool):   # FIX 1: inherit BaseTool
                     error=f"exit_code_{gdb_result.exit_code}",
                 )
 
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error(f"[GDBTool] Timeout after {self.timeout}s")
             return ToolResult(
                 success=False,
@@ -215,10 +216,10 @@ class GDBTool(BaseTool):   # FIX 1: inherit BaseTool
     async def _run_gdb(
         self,
         command:        str,
-        core_path:      Optional[str]       = None,
-        pid:            Optional[int]        = None,
-        executable:     Optional[str]        = None,
-        extra_commands: Optional[List[str]]  = None,
+        core_path:      str | None       = None,
+        pid:            int | None        = None,
+        executable:     str | None        = None,
+        extra_commands: list[str] | None  = None,
     ) -> GDBResult:
         cmd = [self.gdb_path, "--batch", "-n", "--quiet", "--nx"]
 
@@ -261,17 +262,15 @@ class GDBTool(BaseTool):   # FIX 1: inherit BaseTool
                 exit_code=proc.returncode or 0,
             )
 
-        except asyncio.TimeoutError:
+        except TimeoutError:
             # Kill entire process group (Unix) or just the process (Windows)
             if not _IS_WINDOWS:
                 try:
                     os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
                     await asyncio.wait_for(proc.wait(), timeout=2.0)
-                except (asyncio.TimeoutError, ProcessLookupError):
-                    try:
+                except (TimeoutError, ProcessLookupError):
+                    with contextlib.suppress(ProcessLookupError):
                         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
             else:
                 proc.kill()
             raise
@@ -280,13 +279,13 @@ class GDBTool(BaseTool):   # FIX 1: inherit BaseTool
     # Output parsing
     # ------------------------------------------------------------------
 
-    def _parse_gdb_output(self, output: str) -> Dict[str, Any]:
+    def _parse_gdb_output(self, output: str) -> dict[str, Any]:
         """Universal parser for x86/x64/ARM output."""
-        findings:     List[Dict]       = []
-        stack_trace:  List[str]        = []
-        registers:    Dict[str, str]   = {}
-        signal_info:  Optional[str]    = None
-        fault_address: Optional[str]   = None
+        findings:     list[dict]       = []
+        stack_trace:  list[str]        = []
+        registers:    dict[str, str]   = {}
+        signal_info:  str | None    = None
+        fault_address: str | None   = None
 
         # FIX 5: compile signal name set as lowercase for case-insensitive matching
         _SIGNAL_NAMES = frozenset(
@@ -344,7 +343,7 @@ class GDBTool(BaseTool):   # FIX 1: inherit BaseTool
         }
 
     @staticmethod
-    def _analyze_aslr_entropy(maps_output: str) -> Optional[float]:
+    def _analyze_aslr_entropy(maps_output: str) -> float | None:
         """
         Rough ASLR entropy from memory maps.
 
@@ -355,7 +354,7 @@ class GDBTool(BaseTool):   # FIX 1: inherit BaseTool
         if len(addresses) < 5:
             return None
         # Count unique top-32-bit prefixes
-        unique_high = len(set(addr[:8] for addr in addresses))
+        unique_high = len({addr[:8] for addr in addresses})
         entropy = (unique_high / len(addresses)) * 32.0
         return round(entropy, 2)
 
@@ -367,7 +366,7 @@ class GDBTool(BaseTool):   # FIX 1: inherit BaseTool
     # Helpers
     # ------------------------------------------------------------------
 
-    def get_preset_commands(self) -> Dict[str, str]:
+    def get_preset_commands(self) -> dict[str, str]:
         return self.PRESET_COMMANDS.copy()
 
     def __repr__(self) -> str:
@@ -382,7 +381,7 @@ class GDBTool(BaseTool):   # FIX 1: inherit BaseTool
 # ---------------------------------------------------------------------------
 
 def create_gdb_tool(
-    gdb_path:        Optional[str] = None,
+    gdb_path:        str | None = None,
     timeout_seconds: float         = 45.0,
     **kwargs,
 ) -> GDBTool:
