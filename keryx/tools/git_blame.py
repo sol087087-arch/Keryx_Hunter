@@ -478,9 +478,9 @@ class GitBlameTool(BaseTool):
     def _kill_proc(proc: asyncio.subprocess.Process) -> None:
         """Kill the subprocess (and its group on Unix) immediately."""
         # BUG-FIX 4: SIGKILL not SIGTERM; no magic numbers
-        if sys.platform == "win32":
-            proc.kill()
-            return
+        if sys.platform == "win32":  # pragma: no cover
+            proc.kill()  # pragma: no cover
+            return  # pragma: no cover
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except (ProcessLookupError, OSError):

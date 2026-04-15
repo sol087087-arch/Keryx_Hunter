@@ -82,9 +82,12 @@ _LAZY: dict[str, str] = {
     "ToolBox":               ".tools.Toolbox",
 
     # Advisors
-    "AdvisorManager":        ".advisors.manager",
-    "LocalAdvisor":          ".advisors.local_advisor",
-    "CloudAdvisor":          ".advisors.cloud_advisor",
+    "AdvisorManager":           ".advisors.manager",
+    "LocalAdvisor":             ".advisors.local_advisor",
+    "CloudAdvisor":             ".advisors.cloud_advisor",
+    "AdvancedCascadeAdvisor":   ".advisors.cascade",
+    "CascadeConfig":            ".advisors.cascade",
+    "create_cascade_advisor":   ".advisors.cascade",
 
     # Knowledge
     "VulnerabilityGraph":    ".knowledge.graph",

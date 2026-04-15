@@ -89,7 +89,7 @@ class ModelInterface(ABC):
         grammar: str | None = None,
         max_tokens: int | None = None,
     ) -> str:
-        pass
+        pass  # pragma: no cover
 
     @abstractmethod
     def generate_result(
@@ -97,7 +97,7 @@ class ModelInterface(ABC):
         prompt: str,
         config: GenerationConfig | None = None,
     ) -> GenerationResult:
-        pass
+        pass  # pragma: no cover
 
     @abstractmethod
     def generate_stream(
@@ -105,7 +105,7 @@ class ModelInterface(ABC):
         prompt: str,
         config: GenerationConfig | None = None,
     ) -> Iterator[str]:
-        pass
+        pass  # pragma: no cover
 
     @abstractmethod
     def generate_with_tools(
@@ -114,7 +114,7 @@ class ModelInterface(ABC):
         tools: list[ToolDefinition],
         config: GenerationConfig | None = None,
     ) -> str | ToolCall:
-        pass
+        pass  # pragma: no cover
 
     async def generate_async(
         self,
@@ -134,14 +134,14 @@ class ModelInterface(ABC):
 
     @abstractmethod
     def tokenize(self, text: str) -> list[int]:
-        pass
+        pass  # pragma: no cover
 
     def count_tokens(self, text: str) -> int:
         return len(self.tokenize(text))
 
     @abstractmethod
     def get_context_length(self) -> int:
-        pass
+        pass  # pragma: no cover
 
     def get_context_used(self) -> int:
         return 0
@@ -151,22 +151,22 @@ class ModelInterface(ABC):
 
     @abstractmethod
     def is_healthy(self) -> bool:
-        pass
+        pass  # pragma: no cover
 
     @abstractmethod
     def estimate_cost(self, input_tokens: int, output_tokens: int) -> CostEstimate:
-        pass
+        pass  # pragma: no cover
 
     @abstractmethod
     def get_usage_cost(self) -> CostEstimate:
-        pass
+        pass  # pragma: no cover
 
     def reset_cost_tracking(self) -> None:  # noqa: B027
         """No-op default — subclasses override if cost accumulation is tracked."""
 
     @abstractmethod
     def get_capabilities(self) -> ModelCapabilities:
-        pass
+        pass  # pragma: no cover
 
     @property
     def capabilities(self) -> ModelCapabilities:
@@ -192,7 +192,7 @@ class ModelInterface(ABC):
 
     @abstractmethod
     def unload(self) -> None:
-        pass
+        pass  # pragma: no cover
 
     def get_metrics(self) -> dict[str, Any]:
         return {}

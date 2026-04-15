@@ -152,15 +152,10 @@ class CloudAdvisor(BaseAdvisor):
         errors = getattr(context, "parse_errors", 0)
         steps = getattr(context, "steps_taken", 0)
         hypotheses = getattr(context, "hypotheses", [])
-        local_tried = getattr(context, "local_advisor_called", False)
 
         low_conf = conf is not None and conf < self.confidence_threshold
         too_errors = errors >= self.max_parse_errors
         stalled = steps > self.no_progress_after_steps and not hypotheses
-
-        # Cloud is last resort — require local advisor first on low confidence
-        if low_conf and not local_tried:
-            return False
 
         return low_conf or too_errors or stalled
 

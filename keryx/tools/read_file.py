@@ -55,6 +55,8 @@ class ReadFileTool(BaseTool):
         encoding = action_input.get("encoding", self.encoding)
         max_chars = action_input.get("max_chars", self.max_chars)
         max_lines = action_input.get("max_lines", self.max_lines)
+        start_line = action_input.get("start_line")   # 1-based, inclusive
+        end_line   = action_input.get("end_line")     # 1-based, inclusive
 
         if not file_path:
             return ToolResult(
@@ -109,14 +111,27 @@ class ReadFileTool(BaseTool):
                     error="timeout",
                 )
 
-            # Apply line limit
+            # Total line count (before any slicing)
+            all_lines = content.splitlines(keepends=True)
+            total_lines = len(all_lines)
             truncated = False
-            line_count = content.count("\n") + 1 if content else 0
 
+            # start_line / end_line slicing (1-based)
+            if start_line is not None or end_line is not None:
+                sl = max(1, int(start_line or 1)) - 1          # to 0-based
+                el = min(total_lines, int(end_line or total_lines))
+                all_lines = all_lines[sl:el]
+                content = "".join(all_lines)
+                if sl > 0 or el < total_lines:
+                    content = (
+                        f"[Lines {sl+1}–{el} of {total_lines}]\n" + content
+                    )
+
+            # Apply line limit
+            line_count = len(all_lines)
             if max_lines is not None and line_count > max_lines:
-                lines = content.splitlines(keepends=True)
-                content = "".join(lines[:max_lines])
-                content += f"\n... [truncated after {max_lines} lines, total {line_count} lines]"
+                content = "".join(all_lines[:max_lines])
+                content += f"\n... [truncated after {max_lines} lines, total {total_lines} lines]"
                 truncated = True
 
             # Final character limit
@@ -128,12 +143,12 @@ class ReadFileTool(BaseTool):
                 success=True,
                 output=content,
                 data={
-                    "file_path": str(path),
-                    "size_bytes": stat.st_size,
-                    "chars_read": len(content),
-                    "lines_read": content.count("\n") + 1 if content else 0,
-                    "total_lines": line_count,
-                    "truncated": truncated,
+                    "file_path":    str(path),
+                    "size_bytes":   stat.st_size,
+                    "chars_read":   len(content),
+                    "lines_read":   line_count,
+                    "total_lines":  total_lines,
+                    "truncated":    truncated,
                     "encoding_used": encoding,
                 },
                 metadata={

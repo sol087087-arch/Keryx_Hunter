@@ -376,14 +376,14 @@ class AdvisorManager:
                 self._loop_ready.set()
                 try:
                     loop.run_forever()
-                except Exception as exc:
-                    logger.error(f"[AdvisorManager] Sync loop crashed: {exc}")
+                except Exception as exc:  # pragma: no cover
+                    logger.error(f"[AdvisorManager] Sync loop crashed: {exc}")  # pragma: no cover
 
             self._sync_thread = threading.Thread(target=_run, daemon=True, name="advisor-loop")
             self._sync_thread.start()
 
-            if not self._loop_ready.wait(timeout=3.0):
-                raise RuntimeError("[AdvisorManager] Sync event loop failed to start")
+            if not self._loop_ready.wait(timeout=3.0):  # pragma: no cover
+                raise RuntimeError("[AdvisorManager] Sync event loop failed to start")  # pragma: no cover
 
             return loop
 

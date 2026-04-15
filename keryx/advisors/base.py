@@ -39,6 +39,19 @@ class AdvisorResponse:
     priority_files: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def to_dict(self) -> dict[str, Any]:
+        """Serialise to a dict compatible with AdvisorAdvice.from_dict()."""
+        return {
+            "strategy":                    self.strategic_direction,
+            "strategic_direction":         self.strategic_direction,
+            "adjust_confidence_threshold": self.adjust_confidence_threshold,
+            "suggested_hypotheses":        self.suggested_hypotheses,
+            "blacklist_hypotheses":        self.blacklist_hypotheses,
+            "suggested_tools":             self.suggested_tools,
+            "priority_files":              self.priority_files,
+            **self.metadata,
+        }
+
     def is_empty(self) -> bool:
         """
         True if no actionable content.
@@ -285,6 +298,17 @@ class RuleBasedAdvisor(BaseAdvisor):
         self.max_parse_errors = max_parse_errors
         self.no_progress_after_steps = no_progress_after_steps
 
+    @staticmethod
+    def _has_unconfirmed_high(context: Any) -> bool:
+        """True if recent steps contain codeql HIGH findings but no vuln is confirmed yet."""
+        if getattr(context, "confirmed_vulns", []):
+            return False
+        steps = list(getattr(context, "steps", []))[-3:]
+        return any(
+            "[HIGH]" in str(s.get("observation", ""))
+            for s in steps
+        )
+
     def should_trigger(self, context: Any) -> bool:
         conf = getattr(context, 'get_last_confidence', lambda: None)()
         errors = getattr(context, 'parse_errors', 0)
@@ -295,6 +319,7 @@ class RuleBasedAdvisor(BaseAdvisor):
             (conf is not None and conf < self.confidence_threshold)
             or errors >= self.max_parse_errors
             or (steps > self.no_progress_after_steps and not hyps)
+            or self._has_unconfirmed_high(context)   # always advise on unverified HIGH
         )
 
     async def advise(self, context: Any) -> AdvisorResponse:
@@ -305,28 +330,43 @@ class RuleBasedAdvisor(BaseAdvisor):
 
         parts: list[str] = []
         adj = None
+        suggested_tools: list[str] = []
+
+        if self._has_unconfirmed_high(context):
+            parts.append(
+                "codeql_query found HIGH security findings. "
+                "You must run injection_verifier on the vulnerable field before finishing. "
+                "Example: inject 'author' with payload '--upload-pack=test' and "
+                "expected_behavior 'reject'. "
+                "If the target tool is not git_blame, use the actual tool name and "
+                "the field name from the GIT_OPTION_INJECTION finding."
+            )
+            suggested_tools.append("injection_verifier")
 
         if conf is not None and conf < self.confidence_threshold:
             parts.append(
                 f"Confidence low ({conf:.2f}). "
-                "Broaden search: try IPC boundaries and adjacent modules."
+                "Focus on subprocess/shell call boundaries and parameter sanitization. "
+                "Run codeql_query on the full target file to surface all findings at once."
             )
             adj = max(0.4, self.confidence_threshold - 0.1)
 
         if errors >= self.max_parse_errors:
             parts.append(
-                f"Model has {errors} parse errors. "
-                "Simplify prompt or reduce grammar complexity."
+                f"Model produced {errors} parse errors. "
+                "Use simpler action_input — fewer optional fields, plain strings only."
             )
 
         if steps > self.no_progress_after_steps and not hyps:
             parts.append(
                 "No hypotheses after many steps. "
-                "Focus on allocators, GC roots, and IPC serialization."
+                "Pivot: run codeql_query to enumerate all security findings, "
+                "then use git_blame to inspect commit history for recent security-relevant changes."
             )
 
         return AdvisorResponse(
             strategic_direction=" ".join(parts) if parts else "Rules check passed.",
             adjust_confidence_threshold=adj,
+            suggested_tools=suggested_tools,
             metadata={"advisor": self.name, "rules_fired": len(parts)},
         )

@@ -1,9 +1,15 @@
 # keryx/core/shared_context.py
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
+
+
+def _tokenize(text: str) -> list[str]:
+    """Split hypothesis text into lowercase word tokens for Jaccard similarity."""
+    return re.findall(r"[a-z]+", text.lower())
 
 
 @dataclass
@@ -114,7 +120,7 @@ class SharedContext:
         self.steps.append({
             "timestamp":   time.time(),
             "action":      action_record,
-            "observation": observation[:1000],
+            "observation": observation[:8000],
         })
         self.steps_taken += 1
 
@@ -142,9 +148,11 @@ class SharedContext:
                 confidence  = None
             observation = s.get("observation", "")
             conf_str    = f" | conf={confidence:.2f}" if confidence is not None else ""
+            # Show more of the most recent step so the model can read code
+            obs_limit = 3000 if i == len(recent) else 400
             lines.append(
                 f"  [{i}] {action_name}{conf_str}\n"
-                f"      obs: {observation[:200]}{'...' if len(observation) > 200 else ''}"
+                f"      obs: {observation[:obs_limit]}{'...' if len(observation) > obs_limit else ''}"
             )
         return "\n".join(lines)
 
@@ -175,15 +183,54 @@ class SharedContext:
     # ------------------------------------------------------------------
 
     def add_hypothesis(self, text: str) -> None:
-        if text and text not in self.blacklist:
-            self.hypotheses.add(text)
+        if not text or text in self.blacklist:
+            return
+        # Dedup: skip if an existing hypothesis is very similar (Jaccard ≥ 0.6)
+        tokens_new = set(_tokenize(text))
+        for existing in self.hypotheses:
+            tokens_ex = set(_tokenize(existing))
+            union = tokens_new | tokens_ex
+            if union and len(tokens_new & tokens_ex) / len(union) >= 0.6:
+                return  # close enough — don't add a near-duplicate
+        self.hypotheses.add(text)
 
     def blacklist_hypothesis(self, text: str) -> None:
         self.blacklist.add(text)
         self.hypotheses.discard(text)
+        # Also discard near-duplicates of the blacklisted hypothesis
+        tokens_bl = set(_tokenize(text))
+        to_remove = set()
+        for h in self.hypotheses:
+            tokens_h = set(_tokenize(h))
+            union = tokens_bl | tokens_h
+            if union and len(tokens_bl & tokens_h) / len(union) >= 0.55:
+                to_remove.add(h)
+        self.hypotheses -= to_remove
 
     def get_deduplicated_hypotheses(self) -> str:
         return "\n".join(sorted(self.hypotheses)) if self.hypotheses else "No hypotheses yet."
+
+    def cluster_hypotheses(self) -> list[list[str]]:
+        """Group remaining hypotheses into clusters by token similarity (Jaccard ≥ 0.4)."""
+        hyps = sorted(self.hypotheses)
+        clusters: list[list[str]] = []
+        used = set()
+        for i, h in enumerate(hyps):
+            if i in used:
+                continue
+            cluster = [h]
+            tokens_h = set(_tokenize(h))
+            for j, other in enumerate(hyps):
+                if j <= i or j in used:
+                    continue
+                tokens_o = set(_tokenize(other))
+                union = tokens_h | tokens_o
+                if union and len(tokens_h & tokens_o) / len(union) >= 0.4:
+                    cluster.append(other)
+                    used.add(j)
+            used.add(i)
+            clusters.append(cluster)
+        return clusters
 
     # ------------------------------------------------------------------
     # Parse error tracking
@@ -295,6 +342,12 @@ class SharedContext:
     # ------------------------------------------------------------------
 
     def to_dict(self) -> dict[str, Any]:
+        # NOTE: `pending_advisor_advice` is deliberately omitted — it is
+        # transient mid-step state that should not survive a checkpoint
+        # resume.  The full `advisor_advice` history IS preserved so the
+        # Advisor can reason about prior advice after a resume.
+        # NOTE: `routing_plan` is not serialised — the Orchestrator
+        # re-routes on resume from the same config.
         return {
             "target_path":       self.target_path,
             "capability":        self.capability,

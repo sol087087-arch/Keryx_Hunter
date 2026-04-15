@@ -472,20 +472,17 @@ def create_default_toolbox(
     """
     from .git_blame import create_git_blame_tool
     from .read_file import create_read_file_tool
-    # from .codeql import create_codeql_tool      # раскомментировать позже
-    # from .gdb import create_gdb_tool
-    # from .fuzzer import create_fuzzer_tool
+    from .ast_analyzer import create_ast_analyzer_tool
+    from .injection_verifier import create_injection_verifier
 
     toolbox = ToolBox(default_timeout=default_timeout)
 
-    # Критический минимум (без него агент падает на первом шаге)
     toolbox.register(create_read_file_tool(allowed_root=allowed_root))
     toolbox.register(create_git_blame_tool())
-
-    # Остальные инструменты — добавляем по мере готовности
-    # toolbox.register(create_codeql_tool())
-    # toolbox.register(create_gdb_tool())
-    # toolbox.register(create_fuzzer_tool())
+    toolbox.register(create_ast_analyzer_tool(allowed_root=allowed_root))
+    # injection_verifier is registered last — it needs a reference to the
+    # already-populated toolbox so it can dispatch to the target tools.
+    toolbox.register(create_injection_verifier(toolbox))
 
     logger.info(f"[ToolBox] Default toolbox created with {len(toolbox.list_tools())} tools")
     return toolbox

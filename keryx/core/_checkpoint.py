@@ -1,5 +1,19 @@
 # keryx/core/_checkpoint.py
 # CheckpointManager — atomic JSON checkpoint read/write for KeryxOrchestrator.
+#
+# Atomicity guarantee: writes to <name>.tmp then renames — a crash during
+# write leaves the previous checkpoint intact.  rename() is atomic on all
+# POSIX-compliant filesystems (Linux ext4/xfs, macOS APFS/HFS+).
+#
+# What IS preserved across resume:
+#   - All SharedContext state (steps, hypotheses, blacklist, evidence, …)
+#   - Escalation level so the Orchestrator does not restart from level 1
+#   - OrchestratorMetrics snapshot (routing_decisions)
+#
+# What is NOT preserved (intentional):
+#   - pending_advisor_advice  — transient mid-step state, reset is safe
+#   - routing_plan            — re-derived from config on every run
+#   - _start_time             — wall-clock reset; metrics show elapsed since resume
 
 from __future__ import annotations
 

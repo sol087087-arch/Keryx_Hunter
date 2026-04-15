@@ -89,9 +89,8 @@ class RemoteModelConfig:
 # ---------------------------------------------------------------------------
 
 _SCRUB_PATS = [
-    (re.compile(r'/home/[^/\s]+',    re.I), '/workspace'),
-    (re.compile(r'/Users/[^/\s]+',   re.I), '/workspace'),
-    (re.compile(r'C:\\Users\\[^\\\s]+', re.I), 'C:\\workspace'),
+    # Only scrub actual secrets — NOT filesystem paths.
+    # Paths are required context for tool calls and must pass through intact.
     (re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'), '[EMAIL]'),
     (re.compile(r'sk-[A-Za-z0-9]{40,}'), '[API_KEY]'),
     (re.compile(r'AKIA[0-9A-Z]{16}'), '[AWS_KEY]'),
@@ -131,10 +130,12 @@ class RemoteModel(ModelInterface):
         self.cost_per_1k_output_tokens = spec.get("out", 0.0)
         self._ctx_length               = spec.get("ctx", _DEFAULT_CTX)
 
-        self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(config.timeout, connect=10.0),
-            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
-        )
+        # Store client config but do NOT create a shared AsyncClient here.
+        # httpx.AsyncClient binds to the event loop on first use, causing
+        # RuntimeError when the sync background-loop path and the main async
+        # path both try to reuse the same client on different loops.
+        # Instead, generate_async() creates a fresh client per call.
+        self._client_timeout = httpx.Timeout(config.timeout, connect=10.0)
 
         self._session_cost_usd    = 0.0
         self._total_input_tokens  = 0
@@ -255,41 +256,44 @@ class RemoteModel(ModelInterface):
         self._call_count += 1
 
         last_error: Exception | None = None
-        for attempt in range(self.config.max_retries + 1):
-            try:
-                if self.config.provider == "anthropic":
-                    payload = self._build_anthropic_payload(scrubbed, cfg)
-                    url     = f"{self._base_url}/messages"
-                else:
-                    payload = self._build_openai_payload(scrubbed, cfg)
-                    url     = f"{self._base_url}/chat/completions"
+        # Create a fresh client per call — avoids anyio loop-binding errors
+        # when this coroutine runs on a different event loop than __init__.
+        async with httpx.AsyncClient(timeout=self._client_timeout) as client:
+            for attempt in range(self.config.max_retries + 1):
+                try:
+                    if self.config.provider == "anthropic":
+                        payload = self._build_anthropic_payload(scrubbed, cfg)
+                        url     = f"{self._base_url}/messages"
+                    else:
+                        payload = self._build_openai_payload(scrubbed, cfg)
+                        url     = f"{self._base_url}/chat/completions"
 
-                response = await self._client.post(url, json=payload, headers=self._headers)
-                response.raise_for_status()
-                data     = response.json()
-                text, in_t, out_t = self._parse_response(data)
-                self._update_cost(in_t, out_t)
-                self._healthy = True
-                return text
+                    response = await client.post(url, json=payload, headers=self._headers)
+                    response.raise_for_status()
+                    data     = response.json()
+                    text, in_t, out_t = self._parse_response(data)
+                    self._update_cost(in_t, out_t)
+                    self._healthy = True
+                    return text
 
-            except httpx.HTTPStatusError as exc:
-                last_error = exc
-                status     = exc.response.status_code
-                if status == 429:
-                    wait = float(exc.response.headers.get("Retry-After", 2 ** attempt))
-                    logger.warning(f"[RemoteModel] Rate limited — retry in {wait}s")
-                    await asyncio.sleep(wait)
-                elif status in (500, 502, 503, 504):
-                    await asyncio.sleep(2 ** attempt)
-                else:
-                    raise ModelError(f"HTTP {status}: {exc.response.text[:200]}") from exc
+                except httpx.HTTPStatusError as exc:
+                    last_error = exc
+                    status     = exc.response.status_code
+                    if status == 429:
+                        wait = float(exc.response.headers.get("Retry-After", 2 ** attempt))
+                        logger.warning(f"[RemoteModel] Rate limited — retry in {wait}s")
+                        await asyncio.sleep(wait)
+                    elif status in (500, 502, 503, 504):
+                        await asyncio.sleep(2 ** attempt)
+                    else:
+                        raise ModelError(f"HTTP {status}: {exc.response.text[:200]}") from exc
 
-            except (httpx.TimeoutException, httpx.ConnectError) as exc:
-                last_error = exc
-                if attempt < self.config.max_retries:
-                    await asyncio.sleep(2 ** attempt)
-                else:
-                    raise
+                except (httpx.TimeoutException, httpx.ConnectError) as exc:
+                    last_error = exc
+                    if attempt < self.config.max_retries:
+                        await asyncio.sleep(2 ** attempt)
+                    else:
+                        raise
 
         self._healthy = False
         raise ModelError(f"Failed after {self.config.max_retries + 1} attempts: {last_error}")
@@ -394,9 +398,10 @@ class RemoteModel(ModelInterface):
             "tools":      anth_tools,
             "messages":   [{"role": "user", "content": prompt}],
         }
-        response = await self._client.post(
-            f"{self._base_url}/messages", json=payload, headers=self._headers
-        )
+        async with httpx.AsyncClient(timeout=self._client_timeout) as client:
+            response = await client.post(
+                f"{self._base_url}/messages", json=payload, headers=self._headers
+            )
         response.raise_for_status()
         data = response.json()
         self._update_cost(
@@ -425,9 +430,10 @@ class RemoteModel(ModelInterface):
             "tools":       tools,
             "tool_choice": "auto",
         }
-        response = await self._client.post(
-            f"{self._base_url}/chat/completions", json=payload, headers=self._headers
-        )
+        async with httpx.AsyncClient(timeout=self._client_timeout) as client:
+            response = await client.post(
+                f"{self._base_url}/chat/completions", json=payload, headers=self._headers
+            )
         response.raise_for_status()
         data    = response.json()
         usage   = data.get("usage", {})
@@ -466,8 +472,10 @@ class RemoteModel(ModelInterface):
 
     def _parse_response(self, data: dict) -> tuple[str, int, int]:
         if self.config.provider == "anthropic":
-            text    = data["content"][0]["text"]
-            input_t = data["usage"]["input_tokens"]
+            content  = data.get("content", [])
+            text_blocks = [b["text"] for b in content if b.get("type") == "text"]
+            text     = text_blocks[0] if text_blocks else ""
+            input_t  = data["usage"]["input_tokens"]
             output_t = data["usage"]["output_tokens"]
         else:
             text    = data["choices"][0]["message"].get("content") or ""
@@ -540,13 +548,7 @@ class RemoteModel(ModelInterface):
         pass
 
     def unload(self) -> None:
-        """Close async HTTP client via sync wrapper."""
-        if self._sync_loop and not self._sync_loop.is_closed():
-            future = asyncio.run_coroutine_threadsafe(
-                self._client.aclose(), self._sync_loop
-            )
-            with contextlib.suppress(Exception):
-                future.result(timeout=5.0)
+        """Stop the background sync loop thread."""
         if self._sync_loop and not self._sync_loop.is_closed():
             self._sync_loop.call_soon_threadsafe(self._sync_loop.stop)
 
@@ -555,7 +557,7 @@ class RemoteModel(ModelInterface):
         try:
             yield self
         finally:
-            await self._client.aclose()
+            pass  # no persistent client to close
 
     def __repr__(self) -> str:
         return (

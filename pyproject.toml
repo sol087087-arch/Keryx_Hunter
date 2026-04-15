@@ -143,16 +143,15 @@ disallow_any_generics   = true
 [tool.coverage.run]
 omit = [
     # Optional-dependency model backends
+    # local.py and remote.py require llama-cpp-python / anthropic / openai.
+    # swarm.py only uses stdlib + ModelInterface — importable, measured.
     "keryx/models/local.py",
     "keryx/models/remote.py",
-    "keryx/models/remoteV1.py",
-    "keryx/models/swarm.py",
     # Advisor backends — require functional local/cloud model backends
     # (llama-cpp-python, anthropic, openai) which are optional dependencies.
     # Cannot be covered under CI with only core deps installed.
     "keryx/advisors/local_advisor.py",
     "keryx/advisors/cloud_advisor.py",
-    "keryx/advisors/cascade_advisor.py",
     # Optional-dependency tools
     "keryx/tools/codeql.py",
     "keryx/tools/fuzzer.py",
@@ -162,9 +161,7 @@ omit = [
     "keryx/knowledge/embeddings.py",
     "keryx/knowledge/graph.py",
     "keryx/sandbox/container.py",
-    # Legacy / dead code
-    "keryx/models/remoteV1.py",
-    "keryx/tools/git_blameV1.py",
+    # Legacy / dead code (files deleted; entries kept as no-ops for safety)
     "keryx/advisors/shared_context.py",
     # Developer scripts and debug utilities
     "keryx/Debug_lazy.py",

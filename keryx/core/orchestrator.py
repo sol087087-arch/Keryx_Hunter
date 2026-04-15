@@ -3,10 +3,11 @@
 # Sovereign, air-gapped, production ready. Requires Python 3.11+.
 #
 # Heavy lifting is delegated to focused sub-modules:
-#   _airgap.py     — network reachability probe
-#   _checkpoint.py — atomic JSON checkpoint save/load
-#   _swarm.py      — multi-model debate engine
-#   _escalation.py — stateless threshold / predicate helpers
+#   _airgap.py      — network reachability probe
+#   _checkpoint.py  — atomic JSON checkpoint save/load
+#   _resources.py   — system resource checks
+#   _swarm.py       — multi-model debate engine
+#   _escalation.py  — stateless escalation helpers (pure functions)
 
 from __future__ import annotations
 
@@ -20,8 +21,9 @@ from typing import TYPE_CHECKING, Any
 
 from ._airgap import detect_airgap
 from ._checkpoint import CheckpointManager
-from ._escalation import check_resources, get_dynamic_threshold, should_escalate_further
-from ._swarm import SwarmDebate
+from ._escalation import get_max_escalation, get_threshold, next_state, should_escalate
+from ._resources import check_resources
+from ._swarm import OrchestratorSwarmAdapter
 from .agent import KeryxAgent
 from .router import RoutingPlan, create_router
 from .shared_context import SharedContext
@@ -30,19 +32,17 @@ try:
     from ..advisors.manager import AdvisorManager
     from ..models.interface import ModelInterface
     from ..tools.Toolbox import ToolBox
-except ImportError:
-    if TYPE_CHECKING:
+except ImportError:  # pragma: no cover
+    if TYPE_CHECKING:  # pragma: no cover
         from ..advisors.manager import AdvisorManager
         from ..models.interface import ModelInterface
         from ..tools.Toolbox import ToolBox
-    else:
+    else:  # pragma: no cover
         ModelInterface = object  # type: ignore[assignment,misc]
         AdvisorManager = object  # type: ignore[assignment,misc]
         ToolBox = object  # type: ignore[assignment,misc]
 
 logger = logging.getLogger("keryx.orchestrator")
-
-_CHECKPOINT_EVERY_N = 1
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +131,7 @@ class KeryxOrchestrator:
         resume: bool,
         user_budget_usd: float | None,
     ) -> dict[str, Any]:
-        is_airgapped = await self._is_airgapped(mode)
+        is_airgapped = await detect_airgap(mode)
         plan: RoutingPlan = self.router.route(
             capability=capability,
             available_models=self.available_models,
@@ -141,7 +141,7 @@ class KeryxOrchestrator:
         )
         self.metrics.routing_decisions += 1
 
-        self._shared_context = self._load_checkpoint(target_path) if resume else None
+        self._shared_context = self._checkpoints.load(target_path) if resume else None
         if self._shared_context is None:
             self._shared_context = SharedContext(
                 target_path=target_path,
@@ -151,7 +151,7 @@ class KeryxOrchestrator:
             )
 
         escalation_level = self._shared_context.escalation_level
-        max_escalation = 4 if not is_airgapped else 2
+        max_escalation = get_max_escalation(is_airgapped)
         attempts_at_level = 0
         max_attempts = 3
         result: dict[str, Any] | None = None
@@ -169,7 +169,7 @@ class KeryxOrchestrator:
                 result.get("average_confidence", -1.0) if result else -1.0,
             )
 
-            if not await self._check_resources():
+            if not await check_resources():
                 break
 
             agent = KeryxAgent(
@@ -177,7 +177,7 @@ class KeryxOrchestrator:
                 advisor_manager=self.advisor_manager,
                 toolbox=self.toolbox,
                 max_steps=100,
-                confidence_threshold=self._get_dynamic_threshold(escalation_level),
+                confidence_threshold=get_threshold(escalation_level),
                 budget_usd=plan.budget_usd,
                 enforce_airgapped=plan.enforce_no_network,
             )
@@ -195,24 +195,28 @@ class KeryxOrchestrator:
                     "[Orchestrator] Agent failed at level %d: %s", escalation_level, exc
                 )
                 self._shared_context = agent.context
-                attempts_at_level += 1
-                if attempts_at_level >= max_attempts:
-                    escalation_level += 1
-                    attempts_at_level = 0
+                escalation_level, attempts_at_level = next_state(
+                    escalation_level, attempts_at_level, max_attempts
+                )
+                if attempts_at_level == 0:
                     self._shared_context.set_escalation_level(escalation_level)
-                await self._save_checkpoint(target_path)
+                await self._checkpoints.save(
+                    target_path, self._shared_context, self._metrics_snapshot()
+                )
                 continue
 
-            await self._save_checkpoint(target_path)
+            await self._checkpoints.save(
+                target_path, self._shared_context, self._metrics_snapshot()
+            )
 
-            if self._should_escalate_further(result, escalation_level, max_escalation):
-                attempts_at_level += 1
-                if attempts_at_level >= max_attempts:
+            if should_escalate(result, self._shared_context, escalation_level, max_escalation):
+                escalation_level, attempts_at_level = next_state(
+                    escalation_level, attempts_at_level, max_attempts
+                )
+                if attempts_at_level == 0:
                     logger.info(
-                        "[Orchestrator] Max attempts at level %d — escalating", escalation_level
+                        "[Orchestrator] Max attempts — escalating to level %d", escalation_level
                     )
-                    escalation_level += 1
-                    attempts_at_level = 0
                     self._shared_context.set_escalation_level(escalation_level)
                 else:
                     logger.info(
@@ -222,61 +226,14 @@ class KeryxOrchestrator:
             break
 
         if mode == "swarm" and plan.debate_models and result and not self._shutdown_event.is_set():
-            result = await self._run_swarm_debate(result, plan.debate_models)
+            swarm = OrchestratorSwarmAdapter(self.available_models, self.metrics.swarm_votes)
+            result = await swarm.run(result, plan.debate_models)
 
         final = self._build_final_result(result, mode, is_airgapped, escalation_level)
         logger.info(
             "[Orchestrator] Done | confirmed=%d", len(final.get("confirmed_vulns", []))
         )
         return final
-
-    # ------------------------------------------------------------------
-    # Delegation methods — thin wrappers over sub-module functions.
-    # Kept on the class so tests can call and patch them via patch.object.
-    # ------------------------------------------------------------------
-    async def _is_airgapped(self, explicit_mode: str) -> bool:
-        return await detect_airgap(explicit_mode)
-
-    async def _check_resources(self) -> bool:
-        return await check_resources()
-
-    def _get_dynamic_threshold(self, escalation_level: int) -> float:
-        return get_dynamic_threshold(escalation_level)
-
-    def _should_escalate_further(
-        self, result: dict[str, Any], current_level: int, max_escalation: int
-    ) -> bool:
-        if not self._shared_context:
-            return False
-        return should_escalate_further(result, current_level, max_escalation, self._shared_context)
-
-    async def _run_swarm_debate(
-        self, base_result: dict[str, Any], debate_models: list[str]
-    ) -> dict[str, Any]:
-        swarm = SwarmDebate(self.available_models, self.metrics.swarm_votes)
-        return await swarm.run(base_result, debate_models)
-
-    async def _analyze_with_model(
-        self, model: ModelInterface, hypotheses: list[str]
-    ) -> dict[str, bool]:
-        swarm = SwarmDebate(self.available_models, self.metrics.swarm_votes)
-        return await swarm._analyze_with_model(model, hypotheses)
-
-    def _checkpoint_path(self, target_path: str) -> Path:
-        return self._checkpoints.checkpoint_path(target_path)
-
-    async def _save_checkpoint(self, target_path: str) -> None:
-        if not self._shared_context:
-            return
-        await self._checkpoints.save(
-            target_path, self._shared_context, self._metrics_snapshot()
-        )
-
-    def _load_checkpoint(self, target_path: str) -> SharedContext | None:
-        return self._checkpoints.load(target_path)
-
-    def _write_atomic_json(self, path: Path, data: dict[str, Any]) -> None:
-        self._checkpoints._write_atomic(path, data)
 
     # ------------------------------------------------------------------
     # Signal handlers
