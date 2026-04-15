@@ -226,6 +226,36 @@ class _VulnVisitor(ast.NodeVisitor):
                 )
 
     # ------------------------------------------------------------------
+    # R6 — json.loads() / json.load() on a non-literal (LLM output sink)
+    # ------------------------------------------------------------------
+
+    def _check_llm_output_sink(self, node: ast.Call) -> None:
+        """
+        Flags json.loads(x) / json.load(x) where x is not a string literal.
+        These are deserialization sinks that may process LLM output or other
+        external input without schema validation.
+        """
+        func = node.func
+        if not (
+            isinstance(func, ast.Attribute)
+            and func.attr in ("loads", "load")
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "json"
+        ):
+            return
+        if not node.args:
+            return
+        first_arg = node.args[0]
+        if isinstance(first_arg, ast.Constant):
+            return  # literal string — safe
+        arg_repr = getattr(first_arg, "id", None) or ast.unparse(first_arg)
+        self._add(
+            "LLM_OUTPUT_SINK", "MEDIUM", node,
+            f"json.{func.attr}({arg_repr}) — deserializes a non-literal value; "
+            "if the source is LLM output or external input, validate schema before parsing.",
+        )
+
+    # ------------------------------------------------------------------
     # Visitors
     # ------------------------------------------------------------------
 
@@ -234,6 +264,7 @@ class _VulnVisitor(ast.NodeVisitor):
         self._check_missing_dashdash(node)
         self._check_open(node)
         self._check_create_subprocess_exec(node)
+        self._check_llm_output_sink(node)
         self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign) -> None:

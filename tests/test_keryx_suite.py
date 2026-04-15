@@ -9567,6 +9567,60 @@ proc = asyncio.create_subprocess_exec(*cmd)
         assert isinstance(t, ASTAnalyzerTool)
         assert t.name == "codeql_query"
 
+    # ── R6 LLM_OUTPUT_SINK ────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_r6_json_loads_variable_flagged(self, tool, tmp_path) -> None:
+        """json.loads(variable) — non-literal arg triggers LLM_OUTPUT_SINK."""
+        src = "import json\nresult = json.loads(raw_text)\n"
+        f = self._write(tmp_path, "r6a.py", src)
+        result = await tool.execute({"path": str(f)})
+        assert result.success
+        rules = [fd["rule"] for fd in result.data["findings"]]
+        assert "LLM_OUTPUT_SINK" in rules
+
+    @pytest.mark.asyncio
+    async def test_r6_json_loads_literal_not_flagged(self, tool, tmp_path) -> None:
+        """json.loads('{}') — literal string is safe, no finding."""
+        src = 'import json\nx = json.loads("{}")\n'
+        f = self._write(tmp_path, "r6b.py", src)
+        result = await tool.execute({"path": str(f)})
+        assert result.success
+        rules = [fd["rule"] for fd in result.data["findings"]]
+        assert "LLM_OUTPUT_SINK" not in rules
+
+    @pytest.mark.asyncio
+    async def test_r6_json_load_call_expr_flagged(self, tool, tmp_path) -> None:
+        """json.loads(func()) — call expression as arg is also flagged."""
+        src = "import json\ndata = json.loads(get_response())\n"
+        f = self._write(tmp_path, "r6c.py", src)
+        result = await tool.execute({"path": str(f)})
+        assert result.success
+        rules = [fd["rule"] for fd in result.data["findings"]]
+        assert "LLM_OUTPUT_SINK" in rules
+
+    @pytest.mark.asyncio
+    async def test_r6_severity_is_medium(self, tool, tmp_path) -> None:
+        """LLM_OUTPUT_SINK is MEDIUM severity (exploitability requires specific context)."""
+        src = "import json\nresult = json.loads(raw)\n"
+        f = self._write(tmp_path, "r6d.py", src)
+        result = await tool.execute({"path": str(f)})
+        assert result.success
+        sinks = [fd for fd in result.data["findings"] if fd["rule"] == "LLM_OUTPUT_SINK"]
+        assert sinks
+        assert sinks[0]["severity"] == "MEDIUM"
+
+    @pytest.mark.asyncio
+    async def test_r6_no_positional_args_not_flagged(self, tool, tmp_path) -> None:
+        """json.loads() call with zero positional args — no finding (guard line)."""
+        # Syntactically valid but zero positional args → 'if not node.args: return'
+        src = "import json\njson.loads()\n"
+        f = self._write(tmp_path, "r6e.py", src)
+        result = await tool.execute({"path": str(f)})
+        assert result.success
+        rules = [fd["rule"] for fd in result.data["findings"]]
+        assert "LLM_OUTPUT_SINK" not in rules
+
     def test_factory_with_allowed_root(self, tmp_path) -> None:
         from keryx.tools.ast_analyzer import create_ast_analyzer_tool
         t = create_ast_analyzer_tool(allowed_root=str(tmp_path))
@@ -10027,4 +10081,125 @@ class TestAgentMissingLinePaths:
         with patch.object(tb, "execute_async", side_effect=RuntimeError("boom")):
             result = await agent._auto_verify_injection(self._HIGH_CQ)
         assert result is False
+        tb.shutdown()
+
+    # ── consecutive_clean early exit (lines 390-396) ────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_consecutive_clean_exits_early(self, am) -> None:
+        """A clean codeql scan (no HIGH) triggers early exit after 1 scan."""
+        class _CleanCQTool(_BaseTool):
+            name = "codeql_query"; description = "clean"
+            async def execute(self, ai, ctx=None):
+                return _ToolResult(success=True,
+                                   output="[AST] No findings in test.py (50 lines analyzed).")
+
+        class _CleanCQModel(MyLocalModel):
+            def __init__(self): super().__init__(); self._n = 0
+            def generate(self, prompt, config=None, *, grammar=None, max_tokens=None):
+                if max_tokens == 1 or grammar is None: return "ok"
+                self._n += 1
+                return json.dumps({"thought": "scan", "action": "codeql_query",
+                    "action_input": {"path": "/tmp/test.py"}, "confidence": 0.7})
+
+        tb = self._tb(_CleanCQTool())
+        agent, adv = self._agent(_CleanCQModel(), tb, mode="flexible", max_steps=10)
+        result = await agent.run("/tmp/test.py", resume=False)
+        adv.shutdown(); tb.shutdown()
+        # Should exit after step 1 (clean scan), not run all 10 steps
+        assert result["steps_taken"] <= 2
+
+    @pytest.mark.asyncio
+    async def test_consecutive_clean_resets_on_high_finding(self, am) -> None:
+        """Clean counter resets when codeql finds a HIGH; early exit deferred."""
+        class _HighThenCleanModel(MyLocalModel):
+            def __init__(self): super().__init__(); self._n = 0
+            def generate(self, prompt, config=None, *, grammar=None, max_tokens=None):
+                if max_tokens == 1 or grammar is None: return "ok"
+                self._n += 1
+                if self._n == 1:
+                    return json.dumps({"thought": "scan", "action": "codeql_query",
+                        "action_input": {"path": "/tmp/test.py"}, "confidence": 0.6})
+                return json.dumps({"thought": "done", "action": "FINISH",
+                    "action_input": {}, "confidence": 0.9})
+
+        tb = self._tb(self._CQTool(self._HIGH_CQ))
+        agent, adv = self._agent(_HighThenCleanModel(), tb, mode="none", max_steps=5)
+        result = await agent.run("/tmp/test.py", resume=False)
+        adv.shutdown(); tb.shutdown()
+        # HIGH found → confirmed immediately (none mode) → not an early clean exit
+        assert agent._consecutive_clean_scans == 0
+
+    # ── _extract_findings_for_verification — UNSANITIZED & OPEN_USER_PATH ──
+
+    def test_extract_findings_unsanitized_arg(self) -> None:
+        """Lines 754-756: UNSANITIZED_SUBPROCESS_ARG rule extracts inject_field."""
+        from keryx.core.agent import KeryxAgent
+        obs = (
+            "[AST] 1 finding(s):\n"
+            "  [1] [HIGH] UNSANITIZED_SUBPROCESS_ARG @ line 8: "
+            "cmd.append(filepath) — variable appended\n"
+        )
+        findings = KeryxAgent._extract_findings_for_verification(obs)
+        # UNSANITIZED_SUBPROCESS_ARG maps to ../../etc/passwd payload
+        rules = [r for r, _, _ in findings]
+        assert "UNSANITIZED_SUBPROCESS_ARG" in rules
+
+    def test_extract_findings_open_user_path(self) -> None:
+        """Lines 759-761: OPEN_USER_PATH rule extracts inject_field via open() pattern."""
+        from keryx.core.agent import KeryxAgent
+        obs = (
+            "[AST] 1 finding(s):\n"
+            "  [1] [HIGH] OPEN_USER_PATH @ line 12: "
+            "open(file_path) — path from variable\n"
+        )
+        findings = KeryxAgent._extract_findings_for_verification(obs)
+        rules = [r for r, _, _ in findings]
+        assert "OPEN_USER_PATH" in rules
+
+    # ── _parse_response missing required key (lines 890-892) ────────────────
+
+    def test_parse_response_json_missing_action_key(self, am) -> None:
+        """JSON with no 'action' field triggers parse-error path."""
+        from keryx.core.agent import KeryxAgent
+        from keryx.core.shared_context import SharedContext
+        tb = self._tb(self._RFTool())
+        agent = KeryxAgent(executor_model=FinishModel(), advisor_manager=am,
+                           toolbox=tb, max_steps=1)
+        agent.context = SharedContext(target_path="/tmp/x.py")
+        before = agent.context.parse_errors
+        # JSON dict with no 'action' key
+        result = agent._parse_response('{"thought": "hmm", "confidence": 0.5}')
+        assert agent.context.parse_errors > before
+        assert result.action == "NO_ACTION"
+        tb.shutdown()
+
+    def test_parse_response_json_non_dict(self, am) -> None:
+        """JSON array (not a dict) also triggers the required-key guard."""
+        from keryx.core.agent import KeryxAgent
+        from keryx.core.shared_context import SharedContext
+        tb = self._tb(self._RFTool())
+        agent = KeryxAgent(executor_model=FinishModel(), advisor_manager=am,
+                           toolbox=tb, max_steps=1)
+        agent.context = SharedContext(target_path="/tmp/x.py")
+        before = agent.context.parse_errors
+        result = agent._parse_response('[1, 2, 3]')
+        assert agent.context.parse_errors > before
+        assert result.action == "NO_ACTION"
+        tb.shutdown()
+
+    # ── _extract_json HTML/control-char stripping ────────────────────────────
+
+    def test_extract_json_strips_html_tags(self, am) -> None:
+        """HTML-like injection attempts are stripped before JSON extraction."""
+        from keryx.core.agent import KeryxAgent
+        from keryx.core.shared_context import SharedContext
+        tb = self._tb(self._RFTool())
+        agent = KeryxAgent(executor_model=FinishModel(), advisor_manager=am,
+                           toolbox=tb, max_steps=1)
+        agent.context = SharedContext(target_path="/tmp/x.py")
+        raw = '<script>alert(1)</script>{"thought":"t","action":"FINISH","action_input":{},"confidence":0.9}'
+        extracted = agent._extract_json(raw)
+        assert extracted is not None
+        assert "<script>" not in extracted
         tb.shutdown()

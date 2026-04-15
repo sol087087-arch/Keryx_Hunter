@@ -185,6 +185,10 @@ class KeryxAgent:
         self._consecutive_low_confidence:   int = 0   # P4: low-conf streak
         self._codeql_unconfirmed:           bool = False  # P4: AST found HIGH but not confirmed
         self._codeql_high_observation:     str  = ""    # observation snapshot from the triggering codeql step
+        # Early-exit: break after this many consecutive clean codeql scans (no HIGH findings).
+        # 1 = exit on first clean scan (fast mode); set higher to let agent probe more paths.
+        self._consecutive_clean_scans:      int  = 0
+        self._max_clean_scans_before_exit:  int  = 1
 
     # ------------------------------------------------------------------
     # Context property
@@ -376,6 +380,20 @@ class KeryxAgent:
                 and self._observation_confirms_vuln(action.observation)
             ):
                 self._codeql_unconfirmed = True
+
+            # Early exit: consecutive clean codeql scans (no HIGH findings).
+            # A clean scan means the AST found nothing — continuing wastes budget.
+            if action.action == "codeql_query":
+                if self._observation_confirms_vuln(action.observation):
+                    self._consecutive_clean_scans = 0   # reset on any HIGH finding
+                else:
+                    self._consecutive_clean_scans += 1
+                    if self._consecutive_clean_scans >= self._max_clean_scans_before_exit:
+                        print(
+                            f"[Agent] codeql returned no findings "
+                            f"({self._consecutive_clean_scans}x clean) — early exit."
+                        )
+                        break
 
             # ── Apply advisor advice ──────────────────────────────────────
             if self.context.has_pending_advisor_advice():
@@ -821,6 +839,11 @@ class KeryxAgent:
     # ------------------------------------------------------------------
 
     def _extract_json(self, raw: str) -> str | None:
+        import re
+        # Strip HTML-like injection attempts (e.g. <script>, </tool_call>) and
+        # C0/C1 control characters that can smuggle payloads past JSON parsers.
+        raw = re.sub(r'<[^>]{0,200}>', '', raw)
+        raw = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', raw)
         raw = raw.strip()
         if raw.startswith("```"):
             parts = raw.split("```")
@@ -861,6 +884,12 @@ class KeryxAgent:
 
         try:
             data = json.loads(json_str)
+            if not isinstance(data, dict) or "action" not in data:
+                # Structurally invalid — missing required key means the model
+                # produced something that looks like JSON but isn't our schema.
+                print("[WARN] JSON missing required 'action' key — treating as parse error")
+                self.context.increment_parse_errors()
+                return self._fallback_parse(raw)
             return AgentStep(
                 thought=      str(data.get("thought", "")),
                 action=       str(data.get("action", "NO_ACTION")),
