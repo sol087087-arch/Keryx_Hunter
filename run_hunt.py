@@ -125,15 +125,24 @@ async def main() -> None:
     advisor = AdvisorManager()
     advisor.register(cascade, priority=50)
 
+    from keryx.core.hunt_config import HuntConfig
+
+    # Default config — override with HuntConfig.fast() / HuntConfig.deep() as needed.
+    config = HuntConfig(
+        max_steps=25,
+        confidence_threshold=0.60,
+        budget_usd=2.00,
+        verification_mode="flexible",
+        max_clean_scans_before_exit=1,
+        generate_timeout=60.0,
+    )
+
     agent = KeryxAgent(
         executor_model=model,
         critique_model=critique_model,
         advisor_manager=advisor,
         toolbox=toolbox,
-        max_steps=25,
-        confidence_threshold=0.60,
-        budget_usd=2.00,
-        generate_timeout=60.0,
+        **config.to_agent_kwargs(),
     )
 
     result = await agent.run(TARGET, capability="deep_reasoning", resume=False)

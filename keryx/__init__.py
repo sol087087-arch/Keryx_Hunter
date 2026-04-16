@@ -60,6 +60,7 @@ _LAZY: dict[str, str] = {
     "KeryxOrchestrator":     ".core.orchestrator",
     "KeryxAgent":            ".core.agent",
     "CapabilityRouter":      ".core.router",
+    "HuntConfig":            ".core.hunt_config",
 
     # Models
     "LocalModel":            ".models.local",
@@ -187,6 +188,7 @@ __all__ = [
     "KeryxOrchestrator",
     "KeryxAgent",
     "CapabilityRouter",
+    "HuntConfig",
 
     # Lazy — tools
     "GitBlameTool",

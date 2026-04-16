@@ -153,6 +153,7 @@ class KeryxAgent:
         enforce_airgapped:    bool           = False,
         critique_model:       ModelInterface | None = None,
         verification_mode:    Literal["none", "strict", "flexible"] = "flexible",
+        max_clean_scans_before_exit: int = 1,
     ) -> None:
         self.executor             = executor_model
         # critique_executor handles health checks, self-critique, and other
@@ -188,7 +189,7 @@ class KeryxAgent:
         # Early-exit: break after this many consecutive clean codeql scans (no HIGH findings).
         # 1 = exit on first clean scan (fast mode); set higher to let agent probe more paths.
         self._consecutive_clean_scans:      int  = 0
-        self._max_clean_scans_before_exit:  int  = 1
+        self._max_clean_scans_before_exit:  int  = max_clean_scans_before_exit
 
     # ------------------------------------------------------------------
     # Context property
@@ -263,20 +264,11 @@ class KeryxAgent:
 
         while self.context.steps_taken < self.max_steps:
 
-            # ── Budget ────────────────────────────────────────────────────
-            if self.budget and not self.budget.can_proceed(self.executor):
-                print(
-                    f"[Agent] Budget exhausted "
-                    f"(${self.budget.current_cost:.4f} / ${self.budget.max_cost_usd}) — finishing."
-                )
+            # ── Pre-step guard (budget + health) ─────────────────────────
+            precond = await self._precondition_check()
+            if precond == "break":
                 break
-
-            # ── Health ────────────────────────────────────────────────────
-            if not await self._check_model_health():
-                self._consecutive_failures += 1
-                if self._consecutive_failures >= self._max_consecutive_failures:
-                    print("[Agent] Model unhealthy — cannot continue.")
-                    break
+            if precond == "continue":
                 continue
 
             step = self.context.steps_taken + 1
@@ -323,6 +315,9 @@ class KeryxAgent:
 
             # ── Execute tool ──────────────────────────────────────────────
             _prev_hyp_count = len(self.context.hypotheses)   # P4: stagnation baseline
+            # Extract hypothesis before tool execution so it is always defined,
+            # even if the tool raises (it is referenced in stop checks below).
+            hyp = action.action_input.get("hypothesis", "")
             if action.action not in ("NO_ACTION", "FINISH"):
                 try:
                     observation = await asyncio.wait_for(
@@ -333,8 +328,6 @@ class KeryxAgent:
                     self.context.add_step(action, observation)
                     print(f"[Tool] {action.action} completed in {time.time() - action.timestamp:.2f}s")
 
-                    # Register hypothesis before critique so it can be blacklisted
-                    hyp = action.action_input.get("hypothesis", "")
                     if hyp:
                         self.context.add_hypothesis(hyp)
                         # Record non-trivial observations as evidence
@@ -381,19 +374,9 @@ class KeryxAgent:
             ):
                 self._codeql_unconfirmed = True
 
-            # Early exit: consecutive clean codeql scans (no HIGH findings).
-            # A clean scan means the AST found nothing — continuing wastes budget.
-            if action.action == "codeql_query":
-                if self._observation_confirms_vuln(action.observation):
-                    self._consecutive_clean_scans = 0   # reset on any HIGH finding
-                else:
-                    self._consecutive_clean_scans += 1
-                    if self._consecutive_clean_scans >= self._max_clean_scans_before_exit:
-                        print(
-                            f"[Agent] codeql returned no findings "
-                            f"({self._consecutive_clean_scans}x clean) — early exit."
-                        )
-                        break
+            # Early exit: clean codeql scan (no HIGH findings).
+            if self._should_exit_clean(action):
+                break
 
             # ── Apply advisor advice ──────────────────────────────────────
             if self.context.has_pending_advisor_advice():
@@ -402,119 +385,9 @@ class KeryxAgent:
             # ── Escalate ─────────────────────────────────────────────────
             await self._maybe_escalate()
 
-            # ── Early stop — vuln confirmed ───────────────────────────────
-            # codeql_query (AST analyzer) is objective on HIGH findings.
-            # After AST confirms, auto-run injection_verifier (0 extra LLM tokens)
-            # to attempt dynamic proof before declaring the vuln confirmed.
-            # Other vuln-confirming tools (fuzzer, gdb, injection_verifier) require
-            # high confidence + crash/confirmed signal.
-            ast_found = (
-                action.action == "codeql_query"
-                and self._observation_confirms_vuln(action.observation)
-            )
-            # injection_verifier uses a lower confidence bar — VULN_CONFIRMED in output
-            # is already an objective signal, no need for model confidence >= 0.85.
-            dynamic_confirmed = (
-                (
-                    action.confidence >= 0.85
-                    and action.action in _VULN_CONFIRMING_TOOLS - {"codeql_query", "injection_verifier"}
-                    and self._observation_confirms_vuln(action.observation)
-                )
-                or (
-                    action.action == "injection_verifier"
-                    and self._observation_confirms_vuln(action.observation)
-                )
-            )
-
-            # ── Three-mode confirmation dispatch ──────────────────────────
-            if ast_found:
-                mode = self._verification_mode
-
-                if mode == "none":
-                    # Immediate static confirm — no verifier, no window.
-                    # Designed for fast batch scans where speed > precision.
-                    self._codeql_unconfirmed = False
-                    print("[Agent] none mode — static confirm (AST-only).")
-                    self.context.confirmed_vulns.append({
-                        "step":           step,
-                        "action":         action.action,
-                        "observation":    action.observation[:500],
-                        "confidence":     action.confidence,
-                        "hypothesis":     hyp,
-                        "verified":       False,
-                        "confidence_tag": "AST-only",
-                    })
-                    break
-
-                elif mode == "strict":
-                    # Auto-verify via injection_verifier — no extra LLM step.
-                    # Designed for CI/CD: deterministic, reproducible.
-                    iv_ok = await self._auto_verify_injection(action.observation)
-                    tag = "AST+injection_verifier" if iv_ok else "AST-only"
-                    self._codeql_unconfirmed = False
-                    print(f"[Agent] strict mode — confirmed ({tag}).")
-                    self.context.confirmed_vulns.append({
-                        "step":           step,
-                        "action":         action.action,
-                        "observation":    action.observation[:500],
-                        "confidence":     action.confidence,
-                        "hypothesis":     hyp,
-                        "verified":       iv_ok,
-                        "confidence_tag": tag,
-                    })
-                    break
-
-                else:  # "flexible"
-                    # Give agent 2 steps to call injection_verifier itself.
-                    # After the window, fall through to static_fallback below.
-                    if self._codeql_high_found_step < 0:
-                        self._codeql_high_found_step = self.context.steps_taken
-                        self._codeql_high_observation = action.observation[:800]
-                        print(
-                            "[Agent] flexible mode — codeql HIGH found. "
-                            "Agent has 2 steps to run injection_verifier."
-                        )
-
-            # flexible static fallback: window elapsed → confirm on AST alone
-            static_fallback = (
-                self._verification_mode == "flexible"
-                and self._codeql_unconfirmed
-                and self._codeql_high_found_step >= 0
-                and (self.context.steps_taken - self._codeql_high_found_step) >= 2
-            )
-            if static_fallback:
-                print("[Agent] Verification window elapsed — confirming (AST-only).")
-                self._codeql_unconfirmed = False
-                self.context.confirmed_vulns.append({
-                    "step":           self._codeql_high_found_step,
-                    "action":         "codeql_query",
-                    "observation":    self._codeql_high_observation,
-                    "confidence":     action.confidence,
-                    "hypothesis":     hyp,
-                    "verified":       False,
-                    "confidence_tag": "AST-only",
-                })
-                break
-
-            # dynamic confirm: injection_verifier returned VULN_CONFIRMED
-            if dynamic_confirmed:
-                self._codeql_unconfirmed = False
-                self._codeql_high_found_step = -100
-                self._codeql_high_observation = ""
-                print("[Agent] Dynamically confirmed via injection_verifier — stopping early.")
-                self.context.confirmed_vulns.append({
-                    "step":           step,
-                    "action":         action.action,
-                    "observation":    action.observation[:500],
-                    "confidence":     action.confidence,
-                    "hypothesis":     hyp,
-                    "verified":       True,
-                    "confidence_tag": "AST+injection_verifier",
-                })
-                break
-
-            if action.action == "FINISH":
-                print("[Agent] Executor signalled FINISH.")
+            # ── Vuln confirmation stop conditions ─────────────────────────
+            # (three-mode dispatch, static fallback, dynamic confirm, FINISH)
+            if await self._should_stop_on_confirmation(action, step, hyp):
                 break
 
             # ── Checkpoint every 5 steps ──────────────────────────────────
@@ -646,6 +519,171 @@ class KeryxAgent:
             print(f"[Critique] Confidence boosted to {action.confidence:.2f}")
 
         self.context.add_critique(critique)
+
+    # ------------------------------------------------------------------
+    # Loop control helpers — each stop condition in one testable place
+    # ------------------------------------------------------------------
+
+    async def _precondition_check(self) -> Literal["proceed", "break", "continue"]:
+        """
+        Pre-step gate: budget and model health.
+
+        Returns:
+            "proceed"  — all clear, run the step
+            "break"    — terminate the hunt loop
+            "continue" — skip this iteration (health flap, try again next step)
+        """
+        if self.budget and not self.budget.can_proceed(self.executor):
+            print(
+                f"[Agent] Budget exhausted "
+                f"(${self.budget.current_cost:.4f} / ${self.budget.max_cost_usd}) — finishing."
+            )
+            return "break"
+        if not await self._check_model_health():
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self._max_consecutive_failures:
+                print("[Agent] Model unhealthy — cannot continue.")
+                return "break"
+            return "continue"
+        return "proceed"
+
+    def _should_exit_clean(self, action: AgentStep) -> bool:
+        """
+        Returns True if the loop should stop due to a clean codeql scan.
+
+        A clean scan (no HIGH findings) increments the counter.
+        Any HIGH finding resets it.  When the threshold is reached, early exit.
+        Called BEFORE advisor advice so we don't waste an LLM call on a clean file.
+        """
+        if action.action != "codeql_query":
+            return False
+        if self._observation_confirms_vuln(action.observation):
+            self._consecutive_clean_scans = 0   # HIGH found — reset counter
+            return False
+        self._consecutive_clean_scans += 1
+        if self._consecutive_clean_scans >= self._max_clean_scans_before_exit:
+            print(
+                f"[Agent] codeql returned no findings "
+                f"({self._consecutive_clean_scans}x clean) — early exit."
+            )
+            return True
+        return False
+
+    async def _should_stop_on_confirmation(
+        self, action: AgentStep, step: int, hyp: str
+    ) -> bool:
+        """
+        Post-advisor termination gate: vuln confirmed, static fallback, FINISH.
+
+        Returns True if the loop should stop.
+        Side effects: appends to context.confirmed_vulns, resets verification fields.
+        """
+        ast_found = (
+            action.action == "codeql_query"
+            and self._observation_confirms_vuln(action.observation)
+        )
+        # injection_verifier uses a lower confidence bar — VULN_CONFIRMED in output
+        # is already an objective signal, no need for model confidence >= 0.85.
+        dynamic_confirmed = (
+            (
+                action.confidence >= 0.85
+                and action.action in _VULN_CONFIRMING_TOOLS - {"codeql_query", "injection_verifier"}
+                and self._observation_confirms_vuln(action.observation)
+            )
+            or (
+                action.action == "injection_verifier"
+                and self._observation_confirms_vuln(action.observation)
+            )
+        )
+
+        # ── Three-mode confirmation dispatch ──────────────────────────
+        if ast_found:
+            mode = self._verification_mode
+
+            if mode == "none":
+                # Immediate static confirm — no verifier, no window.
+                self._codeql_unconfirmed = False
+                print("[Agent] none mode — static confirm (AST-only).")
+                self.context.confirmed_vulns.append({
+                    "step":           step,
+                    "action":         action.action,
+                    "observation":    action.observation[:500],
+                    "confidence":     action.confidence,
+                    "hypothesis":     hyp,
+                    "verified":       False,
+                    "confidence_tag": "AST-only",
+                })
+                return True
+
+            elif mode == "strict":
+                # Auto-verify via injection_verifier — no extra LLM step.
+                iv_ok = await self._auto_verify_injection(action.observation)
+                tag = "AST+injection_verifier" if iv_ok else "AST-only"
+                self._codeql_unconfirmed = False
+                print(f"[Agent] strict mode — confirmed ({tag}).")
+                self.context.confirmed_vulns.append({
+                    "step":           step,
+                    "action":         action.action,
+                    "observation":    action.observation[:500],
+                    "confidence":     action.confidence,
+                    "hypothesis":     hyp,
+                    "verified":       iv_ok,
+                    "confidence_tag": tag,
+                })
+                return True
+
+            else:  # "flexible"
+                # Give agent 2 steps to call injection_verifier itself.
+                if self._codeql_high_found_step < 0:
+                    self._codeql_high_found_step = self.context.steps_taken
+                    self._codeql_high_observation = action.observation[:800]
+                    print(
+                        "[Agent] flexible mode — codeql HIGH found. "
+                        "Agent has 2 steps to run injection_verifier."
+                    )
+
+        # flexible static fallback: window elapsed → confirm on AST alone
+        if (
+            self._verification_mode == "flexible"
+            and self._codeql_unconfirmed
+            and self._codeql_high_found_step >= 0
+            and (self.context.steps_taken - self._codeql_high_found_step) >= 2
+        ):
+            print("[Agent] Verification window elapsed — confirming (AST-only).")
+            self._codeql_unconfirmed = False
+            self.context.confirmed_vulns.append({
+                "step":           self._codeql_high_found_step,
+                "action":         "codeql_query",
+                "observation":    self._codeql_high_observation,
+                "confidence":     action.confidence,
+                "hypothesis":     hyp,
+                "verified":       False,
+                "confidence_tag": "AST-only",
+            })
+            return True
+
+        # dynamic confirm: injection_verifier returned VULN_CONFIRMED
+        if dynamic_confirmed:
+            self._codeql_unconfirmed = False
+            self._codeql_high_found_step = -100
+            self._codeql_high_observation = ""
+            print("[Agent] Dynamically confirmed via injection_verifier — stopping early.")
+            self.context.confirmed_vulns.append({
+                "step":           step,
+                "action":         action.action,
+                "observation":    action.observation[:500],
+                "confidence":     action.confidence,
+                "hypothesis":     hyp,
+                "verified":       True,
+                "confidence_tag": "AST+injection_verifier",
+            })
+            return True
+
+        if action.action == "FINISH":
+            print("[Agent] Executor signalled FINISH.")
+            return True
+
+        return False
 
     def _apply_advisor_advice(self) -> None:
         advice = self.context.get_pending_advisor_advice()

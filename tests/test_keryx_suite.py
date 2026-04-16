@@ -10203,3 +10203,193 @@ class TestAgentMissingLinePaths:
         assert extracted is not None
         assert "<script>" not in extracted
         tb.shutdown()
+
+    # ── _should_exit_clean: return False path (line 570) ────────────────────
+
+    def test_should_exit_clean_below_threshold_returns_false(self, am) -> None:
+        """First clean scan when threshold=2 returns False (counter not reached)."""
+        from keryx.core.agent import KeryxAgent, AgentStep
+        from keryx.core.shared_context import SharedContext
+        tb = self._tb(self._RFTool())
+        agent = KeryxAgent(executor_model=FinishModel(), advisor_manager=am,
+                           toolbox=tb, max_steps=5,
+                           max_clean_scans_before_exit=2)
+        agent.context = SharedContext(target_path="/tmp/x.py")
+        clean_action = AgentStep(
+            thought="scan", action="codeql_query", action_input={},
+            observation="[AST] No findings in x.py (10 lines analyzed).",
+        )
+        # First clean scan — threshold is 2, so should NOT exit yet
+        result = agent._should_exit_clean(clean_action)
+        assert result is False
+        assert agent._consecutive_clean_scans == 1
+        tb.shutdown()
+
+    def test_should_exit_clean_at_threshold_returns_true(self, am) -> None:
+        """Second clean scan when threshold=2 returns True."""
+        from keryx.core.agent import KeryxAgent, AgentStep
+        from keryx.core.shared_context import SharedContext
+        tb = self._tb(self._RFTool())
+        agent = KeryxAgent(executor_model=FinishModel(), advisor_manager=am,
+                           toolbox=tb, max_steps=5,
+                           max_clean_scans_before_exit=2)
+        agent.context = SharedContext(target_path="/tmp/x.py")
+        clean_action = AgentStep(
+            thought="scan", action="codeql_query", action_input={},
+            observation="[AST] No findings in x.py (10 lines analyzed).",
+        )
+        agent._should_exit_clean(clean_action)   # first scan → False
+        result = agent._should_exit_clean(clean_action)  # second → True
+        assert result is True
+        assert agent._consecutive_clean_scans == 2
+        tb.shutdown()
+
+    def test_should_exit_clean_non_codeql_action_skipped(self, am) -> None:
+        """Non-codeql actions are ignored by _should_exit_clean."""
+        from keryx.core.agent import KeryxAgent, AgentStep
+        from keryx.core.shared_context import SharedContext
+        tb = self._tb(self._RFTool())
+        agent = KeryxAgent(executor_model=FinishModel(), advisor_manager=am,
+                           toolbox=tb, max_steps=5)
+        agent.context = SharedContext(target_path="/tmp/x.py")
+        rf_action = AgentStep(
+            thought="read", action="read_file", action_input={},
+            observation="file content",
+        )
+        assert agent._should_exit_clean(rf_action) is False
+        assert agent._consecutive_clean_scans == 0   # untouched
+        tb.shutdown()
+
+    # ── _precondition_check ──────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_precondition_check_proceed(self, am) -> None:
+        """Healthy model and no budget → 'proceed'."""
+        from keryx.core.agent import KeryxAgent
+        from keryx.core.shared_context import SharedContext
+        tb = self._tb(self._RFTool())
+        agent = KeryxAgent(executor_model=FinishModel(), advisor_manager=am,
+                           toolbox=tb, max_steps=1)
+        agent.context = SharedContext(target_path="/tmp/x.py")
+        result = await agent._precondition_check()
+        assert result == "proceed"
+        tb.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_precondition_check_budget_exhausted(self, am) -> None:
+        """Budget exhausted → 'break'."""
+        from keryx.core.agent import KeryxAgent, BudgetController
+        from keryx.core.shared_context import SharedContext
+        tb = self._tb(self._RFTool())
+        agent = KeryxAgent(executor_model=FinishModel(), advisor_manager=am,
+                           toolbox=tb, max_steps=1, budget_usd=0.001)
+        agent.context = SharedContext(target_path="/tmp/x.py")
+        agent.budget.current_cost = 1.0   # force-exhaust
+        result = await agent._precondition_check()
+        assert result == "break"
+        tb.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# T52 — HuntConfig dataclass
+# ---------------------------------------------------------------------------
+
+class TestHuntConfig:
+    """T52 — Full coverage of keryx/core/hunt_config.py."""
+
+    def test_defaults(self) -> None:
+        from keryx.core.hunt_config import HuntConfig
+        cfg = HuntConfig()
+        assert cfg.max_steps == 25
+        assert cfg.confidence_threshold == 0.60
+        assert cfg.budget_usd == 2.00
+        assert cfg.verification_mode == "flexible"
+        assert cfg.max_clean_scans_before_exit == 1
+        assert cfg.generate_timeout == 60.0
+        assert cfg.max_prompt_chars == 32_000
+        assert cfg.enforce_airgapped is False
+
+    def test_custom_fields(self) -> None:
+        from keryx.core.hunt_config import HuntConfig
+        cfg = HuntConfig(max_steps=5, budget_usd=None, enforce_airgapped=True)
+        assert cfg.max_steps == 5
+        assert cfg.budget_usd is None
+        assert cfg.enforce_airgapped is True
+
+    def test_to_agent_kwargs_keys(self) -> None:
+        from keryx.core.hunt_config import HuntConfig
+        kwargs = HuntConfig().to_agent_kwargs()
+        expected = {
+            "max_steps", "confidence_threshold", "budget_usd",
+            "verification_mode", "max_clean_scans_before_exit",
+            "generate_timeout", "max_prompt_chars", "enforce_airgapped",
+        }
+        assert set(kwargs.keys()) == expected
+
+    def test_to_agent_kwargs_values_match(self) -> None:
+        from keryx.core.hunt_config import HuntConfig
+        cfg = HuntConfig(max_steps=7, budget_usd=0.5, verification_mode="strict")
+        kw = cfg.to_agent_kwargs()
+        assert kw["max_steps"] == 7
+        assert kw["budget_usd"] == 0.5
+        assert kw["verification_mode"] == "strict"
+
+    def test_to_agent_kwargs_accepted_by_agent(self) -> None:
+        """KeryxAgent.__init__ accepts every key in to_agent_kwargs()."""
+        from keryx.core.hunt_config import HuntConfig
+        from keryx.core.agent import KeryxAgent
+        from keryx.advisors.manager import AdvisorManager
+        from keryx.tools.Toolbox import ToolBox
+        cfg = HuntConfig()
+        am = AdvisorManager()
+        tb = ToolBox()
+        agent = KeryxAgent(executor_model=FinishModel(), advisor_manager=am,
+                           toolbox=tb, **cfg.to_agent_kwargs())
+        assert agent.max_steps == cfg.max_steps
+        assert agent.confidence_threshold == cfg.confidence_threshold
+        am.shutdown()
+
+    def test_repr(self) -> None:
+        from keryx.core.hunt_config import HuntConfig
+        r = repr(HuntConfig())
+        assert "HuntConfig" in r
+        assert "flexible" in r
+
+    # ── Presets ──────────────────────────────────────────────────────────────
+
+    def test_fast_preset(self) -> None:
+        from keryx.core.hunt_config import HuntConfig
+        cfg = HuntConfig.fast()
+        assert cfg.max_steps == 10
+        assert cfg.verification_mode == "strict"
+        assert cfg.budget_usd == 0.50
+        assert cfg.max_clean_scans_before_exit == 1
+        assert cfg.generate_timeout == 30.0
+
+    def test_deep_preset(self) -> None:
+        from keryx.core.hunt_config import HuntConfig
+        cfg = HuntConfig.deep()
+        assert cfg.max_steps == 50
+        assert cfg.confidence_threshold == 0.75
+        assert cfg.max_clean_scans_before_exit == 2
+        assert cfg.budget_usd == 5.00
+
+    def test_local_preset(self) -> None:
+        from keryx.core.hunt_config import HuntConfig
+        cfg = HuntConfig.local()
+        assert cfg.enforce_airgapped is True
+        assert cfg.budget_usd is None
+        assert cfg.generate_timeout == 120.0
+
+    def test_presets_return_distinct_instances(self) -> None:
+        from keryx.core.hunt_config import HuntConfig
+        a = HuntConfig.fast()
+        b = HuntConfig.fast()
+        a.max_steps = 99
+        assert b.max_steps == 10  # mutation of one doesn't affect another
+
+    def test_lazy_import_from_keryx(self) -> None:
+        """HuntConfig is accessible via the top-level keryx package."""
+        import keryx
+        cfg = keryx.HuntConfig()
+        assert cfg.max_steps == 25
