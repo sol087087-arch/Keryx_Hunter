@@ -3,3 +3,6 @@
 .coverage
 .keryx_checkpoints/
 hunt_result.json
+__pycache__/
+*.pyc
+.pytest_cache/
