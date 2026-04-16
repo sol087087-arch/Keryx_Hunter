@@ -1,2 +1,5 @@
 **/*.bak
-**/*.pyc
+**/*.pyc.env
+.coverage
+.keryx_checkpoints/
+hunt_result.json
