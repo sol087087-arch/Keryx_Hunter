@@ -14,7 +14,7 @@ MODULES = [
     "keryx.core.router",
     "keryx.advisors.base",
     "keryx.advisors.manager",
-    "keryx.advisors.cascade_advisor",
+    "keryx.advisors.cascade",
     "keryx.advisors.local_advisor",
     "keryx.advisors.cloud_advisor",
     "keryx.tools.Toolbox",
