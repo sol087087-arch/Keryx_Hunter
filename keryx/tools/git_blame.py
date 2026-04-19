@@ -223,7 +223,7 @@ class GitBlameTool(BaseTool):
         cmd = [self.git_path, "blame", "--line-porcelain"]
         if line_num is not None:
             cmd.extend(["-L", f"{line_num},{line_num}"])
-        cmd.append(file_path)
+        cmd.extend(["--", file_path])
 
         return await self._run_cmd(cmd, extract_authors="blame")
 
@@ -245,13 +245,13 @@ class GitBlameTool(BaseTool):
             "--format=%h|%an|%ae|%s",
         ]
         if author:
-            cmd.extend(["--author", author])
+            cmd.append(f"--author={author}")       # --flag=value: value never a flag
         if grep:
-            cmd.extend(["--grep", grep])
+            cmd.append(f"--grep={grep}")
         if since:
-            cmd.extend(["--since", since])
+            cmd.append(f"--since={since}")
         if log_path:
-            cmd.append(log_path)
+            cmd.extend(["--", log_path])           # -- prevents path as option
 
         return await self._run_cmd(cmd, extract_authors="log")
 
@@ -283,8 +283,8 @@ class GitBlameTool(BaseTool):
                 "--name-only",
             ]
             if since:
-                cmd.extend(["--since", since])
-            cmd.append(path)
+                cmd.append(f"--since={since}")
+            cmd.extend(["--", path])
 
             raw = await self._run_cmd(cmd)
             if raw.exit_code != 0:
@@ -317,7 +317,7 @@ class GitBlameTool(BaseTool):
                 # BUG-FIX 5: build command cleanly, no fragile list.insert()
                 author_cmd = [self.git_path, "log", f"-n{n_commits}"]
                 if since:
-                    author_cmd.extend(["--since", since])
+                    author_cmd.append(f"--since={since}")
                 author_cmd.extend(["--format=%an", "--follow", "--", filepath])
 
                 ar = await self._run_cmd(author_cmd)

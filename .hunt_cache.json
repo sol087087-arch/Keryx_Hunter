@@ -1,0 +1,73 @@
+{
+  "version": 1,
+  "timestamp": 1776499562.990776,
+  "commit": "dde94dae4f7a99a35ef27d0f98ff9ebf0297d9d7",
+  "entries": {
+    "/tmp/vampi/config.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776499458.8305087
+    },
+    "/tmp/vampi/app.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776499458.8304653
+    },
+    "/tmp/vampi/database/__init__.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776499458.8305624
+    },
+    "/tmp/vampi/api_views/users.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776499458.8304124
+    },
+    "/tmp/vampi/api_views/books.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776499458.8302288
+    },
+    "/tmp/vampi/api_views/__init__.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776499458.8301501
+    },
+    "/tmp/vampi/api_views/json_schemas.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776499458.8302827
+    },
+    "/tmp/vampi/api_views/main.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776499458.8303294
+    },
+    "/tmp/vampi/models/user_model.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776499458.8307753
+    },
+    "/tmp/vampi/models/__init__.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776499458.8306677
+    },
+    "/tmp/vampi/models/books_model.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776499458.8307216
+    }
+  }
+}

@@ -1,0 +1,94 @@
+name: Keryx Security Hunt
+
+on:
+  push:
+    branches: ["main", "v2"]
+  pull_request:
+    branches: ["main"]
+  schedule:
+    # Nightly at 02:17 UTC on the default branch
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      top_n:
+        description: "Number of files to hunt (--top-n)"
+        required: false
+        default: "10"
+      escalate_n:
+        description: "Files to escalate to Opus (--escalate-n)"
+        required: false
+        default: "2"
+
+jobs:
+  keryx-hunt:
+    name: Security hunt (AST + LLM)
+    runs-on: ubuntu-latest
+    permissions:
+      # Required to upload SARIF to GitHub Security tab
+      security-events: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history needed for git blame enrichment
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      # ── Phase 0 + Phase 1 (scripted mode — no API key needed for CI) ──────
+      - name: Run Keryx Hunt
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          TOP_N=${{ github.event.inputs.top_n || '10' }}
+          ESC_N=${{ github.event.inputs.escalate_n || '2' }}
+
+          # Use --scripted when no API key is available (fork PRs, etc.)
+          SCRIPTED_FLAG=""
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            SCRIPTED_FLAG="--scripted"
+            echo "No API key — running in scripted (mock) mode"
+          fi
+
+          python scripts/project_hunt.py \
+            --dir keryx \
+            --top-n "$TOP_N" \
+            --escalate-n "$ESC_N" \
+            --default-model haiku \
+            --escalate-model opus \
+            --mode strict \
+            --budget 1.00 \
+            --output-json hunt-report.json \
+            --output-sarif hunt-report.sarif \
+            --output-html hunt-report.html \
+            --fail-if-confirmed \
+            --learn \
+            $SCRIPTED_FLAG
+
+      # ── Upload SARIF to GitHub Security tab ───────────────────────────────
+      - name: Upload SARIF results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: hunt-report.sarif
+          category: keryx-hunt
+
+      # ── Upload reports as build artifacts ─────────────────────────────────
+      - name: Upload hunt reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: keryx-hunt-reports-${{ github.run_number }}
+          path: |
+            hunt-report.json
+            hunt-report.sarif
+            hunt-report.html
+          retention-days: 30

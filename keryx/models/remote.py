@@ -48,10 +48,16 @@ logger = logging.getLogger("keryx.models.remote")
 # ---------------------------------------------------------------------------
 
 _PROVIDER_MODELS: dict[str, dict[str, Any]] = {
-    # Anthropic
-    "claude-opus-4.6":           {"ctx": 200_000, "in": 15.00,  "out": 75.00},
-    "claude-sonnet-4.6":         {"ctx": 200_000, "in":  3.00,  "out": 15.00},
-    "claude-haiku-4.6":          {"ctx": 200_000, "in":  0.80,  "out":  4.00},
+    # Anthropic  (costs are USD per 1k tokens)
+    "claude-opus-4.6":              {"ctx": 200_000, "in": 0.01500, "out": 0.07500},
+    "claude-sonnet-4.6":            {"ctx": 200_000, "in": 0.00300, "out": 0.01500},
+    "claude-haiku-4.6":             {"ctx": 200_000, "in": 0.00080, "out": 0.00400},
+    # Versioned IDs used by the live API
+    "claude-opus-4-6":              {"ctx": 200_000, "in": 0.01500, "out": 0.07500},
+    "claude-sonnet-4-6":            {"ctx": 200_000, "in": 0.00300, "out": 0.01500},
+    "claude-haiku-4-5-20251001":    {"ctx": 200_000, "in": 0.00080, "out": 0.00400},
+    "claude-sonnet-4-5-20251001":   {"ctx": 200_000, "in": 0.00300, "out": 0.01500},
+    "claude-opus-4-5-20251001":     {"ctx": 200_000, "in": 0.01500, "out": 0.07500},
     # OpenAI
     "gpt-5.4":                    {"ctx": 128_000, "in":  2.50,  "out": 10.00},
     "gpt-5.4-mini":               {"ctx": 128_000, "in":  0.15,  "out":  0.60},

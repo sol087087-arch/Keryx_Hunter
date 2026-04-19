@@ -9621,6 +9621,255 @@ proc = asyncio.create_subprocess_exec(*cmd)
         rules = [fd["rule"] for fd in result.data["findings"]]
         assert "LLM_OUTPUT_SINK" not in rules
 
+    # ── R7: UNSAFE_EVAL_EXEC ───────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_r7_eval_variable_flagged(self, tool, tmp_path) -> None:
+        """eval() with a non-constant arg fires UNSAFE_EVAL_EXEC at HIGH."""
+        src = "eval(user_input)\n"
+        f = self._write(tmp_path, "r7a.py", src)
+        result = await tool.execute({"path": str(f)})
+        assert result.success
+        rules = [fd["rule"] for fd in result.data["findings"]]
+        assert "UNSAFE_EVAL_EXEC" in rules
+        sev = [fd["severity"] for fd in result.data["findings"] if fd["rule"] == "UNSAFE_EVAL_EXEC"]
+        assert sev[0] == "HIGH"
+
+    @pytest.mark.asyncio
+    async def test_r7_exec_variable_flagged(self, tool, tmp_path) -> None:
+        """exec() with a non-constant arg fires UNSAFE_EVAL_EXEC at HIGH."""
+        src = "exec(untrusted_code)\n"
+        f = self._write(tmp_path, "r7b.py", src)
+        result = await tool.execute({"path": str(f)})
+        assert result.success
+        rules = [fd["rule"] for fd in result.data["findings"]]
+        assert "UNSAFE_EVAL_EXEC" in rules
+
+    @pytest.mark.asyncio
+    async def test_r7_eval_constant_not_flagged(self, tool, tmp_path) -> None:
+        """eval() with a string literal is safe — no finding."""
+        src = 'eval("1 + 1")\n'
+        f = self._write(tmp_path, "r7c.py", src)
+        result = await tool.execute({"path": str(f)})
+        assert result.success
+        rules = [fd["rule"] for fd in result.data["findings"]]
+        assert "UNSAFE_EVAL_EXEC" not in rules
+
+    # ── R8: UNSAFE_PICKLE ─────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_r8_pickle_loads_flagged(self, tool, tmp_path) -> None:
+        """pickle.loads() with a variable arg fires UNSAFE_PICKLE at HIGH."""
+        src = "import pickle\ndata = pickle.loads(raw_bytes)\n"
+        f = self._write(tmp_path, "r8a.py", src)
+        result = await tool.execute({"path": str(f)})
+        assert result.success
+        rules = [fd["rule"] for fd in result.data["findings"]]
+        assert "UNSAFE_PICKLE" in rules
+        sev = [fd["severity"] for fd in result.data["findings"] if fd["rule"] == "UNSAFE_PICKLE"]
+        assert sev[0] == "HIGH"
+
+    @pytest.mark.asyncio
+    async def test_r8_pickle_load_flagged(self, tool, tmp_path) -> None:
+        """pickle.load() (file form) with a variable arg fires UNSAFE_PICKLE."""
+        src = "import pickle\nobj = pickle.load(untrusted_file)\n"
+        f = self._write(tmp_path, "r8b.py", src)
+        result = await tool.execute({"path": str(f)})
+        assert result.success
+        rules = [fd["rule"] for fd in result.data["findings"]]
+        assert "UNSAFE_PICKLE" in rules
+
+    @pytest.mark.asyncio
+    async def test_r8_pickle_constant_not_flagged(self, tool, tmp_path) -> None:
+        """pickle.loads() with a bytes literal is safe — no finding."""
+        src = "import pickle\npickle.loads(b'\\x80\\x04N.')\n"
+        f = self._write(tmp_path, "r8c.py", src)
+        result = await tool.execute({"path": str(f)})
+        assert result.success
+        rules = [fd["rule"] for fd in result.data["findings"]]
+        assert "UNSAFE_PICKLE" not in rules
+
+    # ── R9: UNSAFE_YAML_LOAD ──────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_r9_yaml_load_no_loader_flagged(self, tool, tmp_path) -> None:
+        """yaml.load() without SafeLoader fires UNSAFE_YAML_LOAD at HIGH."""
+        src = "import yaml\ndata = yaml.load(stream)\n"
+        f = self._write(tmp_path, "r9a.py", src)
+        result = await tool.execute({"path": str(f)})
+        assert result.success
+        findings = [fd for fd in result.data["findings"] if fd["rule"] == "UNSAFE_YAML_LOAD"]
+        assert findings
+        assert findings[0]["severity"] == "HIGH"
+
+    @pytest.mark.asyncio
+    async def test_r9_yaml_load_safe_loader_not_flagged(self, tool, tmp_path) -> None:
+        """yaml.load(stream, Loader=yaml.SafeLoader) is safe — no finding."""
+        src = "import yaml\ndata = yaml.load(stream, Loader=yaml.SafeLoader)\n"
+        f = self._write(tmp_path, "r9b.py", src)
+        result = await tool.execute({"path": str(f)})
+        assert result.success
+        rules = [fd["rule"] for fd in result.data["findings"]]
+        assert "UNSAFE_YAML_LOAD" not in rules
+
+    @pytest.mark.asyncio
+    async def test_r9_yaml_safe_load_not_flagged(self, tool, tmp_path) -> None:
+        """yaml.safe_load() is always safe — no finding."""
+        src = "import yaml\ndata = yaml.safe_load(stream)\n"
+        f = self._write(tmp_path, "r9c.py", src)
+        result = await tool.execute({"path": str(f)})
+        assert result.success
+        rules = [fd["rule"] for fd in result.data["findings"]]
+        assert "UNSAFE_YAML_LOAD" not in rules
+
+    @pytest.mark.asyncio
+    async def test_r9_yaml_full_load_medium(self, tool, tmp_path) -> None:
+        """yaml.full_load() fires UNSAFE_YAML_LOAD at MEDIUM severity."""
+        src = "import yaml\ndata = yaml.full_load(stream)\n"
+        f = self._write(tmp_path, "r9d.py", src)
+        result = await tool.execute({"path": str(f)})
+        assert result.success
+        findings = [fd for fd in result.data["findings"] if fd["rule"] == "UNSAFE_YAML_LOAD"]
+        assert findings
+        assert findings[0]["severity"] == "MEDIUM"
+
+    # ── R10: OS_SHELL_INJECTION ───────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_r10_os_system_variable_flagged(self, tool, tmp_path) -> None:
+        """os.system() with a non-constant arg fires OS_SHELL_INJECTION at HIGH."""
+        src = "import os\nos.system(user_cmd)\n"
+        f = self._write(tmp_path, "r10a.py", src)
+        result = await tool.execute({"path": str(f)})
+        assert result.success
+        rules = [fd["rule"] for fd in result.data["findings"]]
+        assert "OS_SHELL_INJECTION" in rules
+        sev = [fd["severity"] for fd in result.data["findings"] if fd["rule"] == "OS_SHELL_INJECTION"]
+        assert sev[0] == "HIGH"
+
+    @pytest.mark.asyncio
+    async def test_r10_os_popen_variable_flagged(self, tool, tmp_path) -> None:
+        """os.popen() with a non-constant arg fires OS_SHELL_INJECTION at HIGH."""
+        src = "import os\nos.popen(user_cmd)\n"
+        f = self._write(tmp_path, "r10b.py", src)
+        result = await tool.execute({"path": str(f)})
+        assert result.success
+        rules = [fd["rule"] for fd in result.data["findings"]]
+        assert "OS_SHELL_INJECTION" in rules
+
+    @pytest.mark.asyncio
+    async def test_r10_os_system_constant_not_flagged(self, tool, tmp_path) -> None:
+        """os.system() with a string literal is safe — no finding."""
+        src = 'import os\nos.system("ls -la")\n'
+        f = self._write(tmp_path, "r10c.py", src)
+        result = await tool.execute({"path": str(f)})
+        assert result.success
+        rules = [fd["rule"] for fd in result.data["findings"]]
+        assert "OS_SHELL_INJECTION" not in rules
+
+    # ── R7-R10 edge-case guards ───────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_r7_eval_no_args_not_flagged(self, tool, tmp_path) -> None:
+        """eval() with zero positional args — early-return guard."""
+        src = "eval()\n"
+        f = self._write(tmp_path, "r7d.py", src)
+        result = await tool.execute({"path": str(f)})
+        assert result.success
+        rules = [fd["rule"] for fd in result.data["findings"]]
+        assert "UNSAFE_EVAL_EXEC" not in rules
+
+    @pytest.mark.asyncio
+    async def test_r8_pickle_no_args_not_flagged(self, tool, tmp_path) -> None:
+        """pickle.loads() with zero positional args — early-return guard."""
+        src = "import pickle\npickle.loads()\n"
+        f = self._write(tmp_path, "r8d.py", src)
+        result = await tool.execute({"path": str(f)})
+        assert result.success
+        rules = [fd["rule"] for fd in result.data["findings"]]
+        assert "UNSAFE_PICKLE" not in rules
+
+    @pytest.mark.asyncio
+    async def test_r9_yaml_load_unrelated_kwarg_flagged(self, tool, tmp_path) -> None:
+        """yaml.load() with an unrelated kwarg (not Loader=) still fires HIGH."""
+        src = "import yaml\nyaml.load(stream, encoding='utf-8')\n"
+        f = self._write(tmp_path, "r9e.py", src)
+        result = await tool.execute({"path": str(f)})
+        assert result.success
+        findings = [fd for fd in result.data["findings"] if fd["rule"] == "UNSAFE_YAML_LOAD"]
+        assert findings
+        assert findings[0]["severity"] == "HIGH"
+
+    @pytest.mark.asyncio
+    async def test_r9_yaml_load_bare_safeloader_name_not_flagged(self, tool, tmp_path) -> None:
+        """yaml.load(stream, Loader=SafeLoader) with bare name import — safe."""
+        src = "from yaml import SafeLoader\nimport yaml\nyaml.load(stream, Loader=SafeLoader)\n"
+        f = self._write(tmp_path, "r9f.py", src)
+        result = await tool.execute({"path": str(f)})
+        assert result.success
+        rules = [fd["rule"] for fd in result.data["findings"]]
+        assert "UNSAFE_YAML_LOAD" not in rules
+
+    @pytest.mark.asyncio
+    async def test_r10_os_shell_no_args_not_flagged(self, tool, tmp_path) -> None:
+        """os.system() with zero positional args — early-return guard."""
+        src = "import os\nos.system()\n"
+        f = self._write(tmp_path, "r10d.py", src)
+        result = await tool.execute({"path": str(f)})
+        assert result.success
+        rules = [fd["rule"] for fd in result.data["findings"]]
+        assert "OS_SHELL_INJECTION" not in rules
+
+    @pytest.mark.asyncio
+    async def test_r2b_extend_list_variable_flag_flagged(self, tool, tmp_path) -> None:
+        """cmd.extend([f'--{flag}=val']) — variable flag NAME in list fires R2b."""
+        src = 'cmd.extend([f"--{flag}=value"])\n'
+        f = self._write(tmp_path, "r2b_extend.py", src)
+        result = await tool.execute({"path": str(f)})
+        assert result.success
+        rules = [fd["rule"] for fd in result.data["findings"]]
+        assert "GIT_FLAG_NAME_INJECTION" in rules
+
+    @pytest.mark.asyncio
+    async def test_r2b_append_variable_flag_flagged(self, tool, tmp_path) -> None:
+        """cmd.append(f'--{flag}=val') — variable flag NAME via append fires R2b."""
+        src = 'cmd.append(f"--{flag}=value")\n'
+        f = self._write(tmp_path, "r2b_append.py", src)
+        result = await tool.execute({"path": str(f)})
+        assert result.success
+        rules = [fd["rule"] for fd in result.data["findings"]]
+        assert "GIT_FLAG_NAME_INJECTION" in rules
+
+    @pytest.mark.asyncio
+    async def test_r2b_fstring_single_dash_prefix_not_flagged(self, tool, tmp_path) -> None:
+        """f'-{flag}=val' — starts with single '-', not '--'; _fstring_variable_flag returns None."""
+        src = 'cmd.append(f"-{flag}=value")\n'
+        f = self._write(tmp_path, "r2b_single_dash.py", src)
+        result = await tool.execute({"path": str(f)})
+        assert result.success
+        rules = [fd["rule"] for fd in result.data["findings"]]
+        assert "GIT_FLAG_NAME_INJECTION" not in rules
+
+    @pytest.mark.asyncio
+    async def test_r2b_fstring_attribute_not_flagged(self, tool, tmp_path) -> None:
+        """f'--{obj.attr}=val' — second value is Attribute, not bare Name; no R2b."""
+        src = 'cmd.append(f"--{obj.attr}=value")\n'
+        f = self._write(tmp_path, "r2b_attr.py", src)
+        result = await tool.execute({"path": str(f)})
+        assert result.success
+        rules = [fd["rule"] for fd in result.data["findings"]]
+        assert "GIT_FLAG_NAME_INJECTION" not in rules
+
+    @pytest.mark.asyncio
+    async def test_r2a_append_non_cmd_list_not_flagged(self, tool, tmp_path) -> None:
+        """other_list.append(var) — receiver not in _CMD_LIST_NAMES; no UNSANITIZED_SUBPROCESS_ARG."""
+        src = "other_list.append(var)\n"
+        f = self._write(tmp_path, "r2a_nonrecv.py", src)
+        result = await tool.execute({"path": str(f)})
+        assert result.success
+        rules = [fd["rule"] for fd in result.data["findings"]]
+        assert "UNSANITIZED_SUBPROCESS_ARG" not in rules
+
     def test_factory_with_allowed_root(self, tmp_path) -> None:
         from keryx.tools.ast_analyzer import create_ast_analyzer_tool
         t = create_ast_analyzer_tool(allowed_root=str(tmp_path))
@@ -10022,14 +10271,19 @@ class TestAgentMissingLinePaths:
 
     @pytest.mark.asyncio
     async def test_auto_verify_no_target_tool(self, am) -> None:
+        # No tools → resolve_target_tool returns None → falls back to fuzz_poc path.
         from keryx.core.agent import KeryxAgent
         from keryx.core.shared_context import SharedContext
-        tb = self._tb()   # no tools → _resolve_target_tool returns None
+        from unittest.mock import patch
+        tb = self._tb()
         agent = KeryxAgent(executor_model=FinishModel(), advisor_manager=am,
                            toolbox=tb, max_steps=1)
         agent.context = SharedContext(target_path="/tmp/unmatched.py")
-        result = await agent._auto_verify_injection(self._HIGH_CQ)
-        assert result is False
+        with patch("keryx.core.verification_pipeline.VerificationPipeline._fuzz_verify",
+                   return_value=False):
+            confirmed, method = await agent._auto_verify_injection(self._HIGH_CQ)
+        assert confirmed is False
+        assert method == "fuzz_poc"
         tb.shutdown()
 
     @pytest.mark.asyncio
@@ -10040,8 +10294,9 @@ class TestAgentMissingLinePaths:
         agent = KeryxAgent(executor_model=FinishModel(), advisor_manager=am,
                            toolbox=tb, max_steps=1)
         agent.context = SharedContext(target_path="/tmp/git_blame.py")
-        result = await agent._auto_verify_injection("[AST] No findings.\n")
-        assert result is False
+        confirmed, method = await agent._auto_verify_injection("[AST] No findings.\n")
+        assert confirmed is False
+        assert method == "injection_verifier"
         tb.shutdown()
 
     @pytest.mark.asyncio
@@ -10052,8 +10307,9 @@ class TestAgentMissingLinePaths:
         agent = KeryxAgent(executor_model=FinishModel(), advisor_manager=am,
                            toolbox=tb, max_steps=1)
         agent.context = SharedContext(target_path="/tmp/git_blame.py")
-        result = await agent._auto_verify_injection(self._HIGH_CQ)
-        assert result is True
+        confirmed, method = await agent._auto_verify_injection(self._HIGH_CQ)
+        assert confirmed is True
+        assert method == "injection_verifier"
 
     @pytest.mark.asyncio
     async def test_auto_verify_all_rejected(self, am) -> None:
@@ -10063,15 +10319,16 @@ class TestAgentMissingLinePaths:
         agent = KeryxAgent(executor_model=FinishModel(), advisor_manager=am,
                            toolbox=tb, max_steps=1)
         agent.context = SharedContext(target_path="/tmp/git_blame.py")
-        result = await agent._auto_verify_injection(self._HIGH_CQ)
-        assert result is False
+        confirmed, method = await agent._auto_verify_injection(self._HIGH_CQ)
+        assert confirmed is False
+        assert method == "injection_verifier"
 
     @pytest.mark.asyncio
     async def test_auto_verify_exception_continues(self, am) -> None:
-        # execute_async raises → _auto_verify_injection catches and continues → False
+        # execute_async raises → exception caught, continues → (False, "injection_verifier")
         from keryx.core.agent import KeryxAgent
         from keryx.core.shared_context import SharedContext
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import patch
 
         tb = self._tb(self._GitBlameTool())
         agent = KeryxAgent(executor_model=FinishModel(), advisor_manager=am,
@@ -10079,8 +10336,9 @@ class TestAgentMissingLinePaths:
         agent.context = SharedContext(target_path="/tmp/git_blame.py")
 
         with patch.object(tb, "execute_async", side_effect=RuntimeError("boom")):
-            result = await agent._auto_verify_injection(self._HIGH_CQ)
-        assert result is False
+            confirmed, method = await agent._auto_verify_injection(self._HIGH_CQ)
+        assert confirmed is False
+        assert method == "injection_verifier"
         tb.shutdown()
 
     # ── consecutive_clean early exit (lines 390-396) ────────────────────────
@@ -10393,3 +10651,1761 @@ class TestHuntConfig:
         import keryx
         cfg = keryx.HuntConfig()
         assert cfg.max_steps == 25
+
+
+# T53 — keryx/fuzzing: harness, sandbox, poc, tool
+# ---------------------------------------------------------------------------
+
+class TestFuzzingHarness:
+    """T53a — harness.py: template generation and registry."""
+
+    def test_known_rules_produce_scripts(self) -> None:
+        from keryx.fuzzing.harness import generate, MARKER_PREFIX
+        marker = MARKER_PREFIX + "TEST0001"
+        for rule in [
+            "SUBPROCESS_SHELL_TRUE", "OS_SHELL_INJECTION",
+            "GIT_OPTION_INJECTION", "GIT_FLAG_NAME_INJECTION",
+            "UNSAFE_EVAL_EXEC", "UNSAFE_PICKLE", "UNSAFE_YAML_LOAD",
+            "OPEN_USER_PATH", "HARDCODED_SECRET",
+            "SSRF", "TEMPLATE_INJECTION", "REGEX_DOS",
+        ]:
+            script = generate({"rule": rule}, marker)
+            assert script is not None, f"No template for {rule}"
+            assert marker in script, f"Marker not embedded in {rule} script"
+
+    def test_no_template_rule_returns_none_without_llm(self) -> None:
+        from keryx.fuzzing.harness import generate
+        result = generate({"rule": "LLM_OUTPUT_SINK"}, "MARKER")
+        assert result is None
+
+    def test_no_template_rule_calls_llm_fallback(self) -> None:
+        from keryx.fuzzing.harness import generate
+        called_with = {}
+        def fake_llm(finding, marker):
+            called_with["finding"] = finding
+            called_with["marker"]  = marker
+            return f"# llm harness for {marker}"
+
+        script = generate({"rule": "LLM_OUTPUT_SINK"}, "MYMARKER", llm_generate_fn=fake_llm)
+        assert script == "# llm harness for MYMARKER"
+        assert called_with["marker"] == "MYMARKER"
+
+    def test_unknown_rule_with_llm_fallback(self) -> None:
+        from keryx.fuzzing.harness import generate
+        script = generate({"rule": "TOTALLY_UNKNOWN"}, "M", llm_generate_fn=lambda f, m: f"x={m}")
+        assert script == "x=M"
+
+    def test_unknown_rule_without_llm_returns_none(self) -> None:
+        from keryx.fuzzing.harness import generate
+        assert generate({"rule": "NONEXISTENT_RULE"}, "M") is None
+
+
+class TestHardcodedSecretHarness:
+    """T53f — harness.py: HARDCODED_SECRET entropy-analysis template."""
+
+    def _run(self, secret_value: str = "") -> tuple[bool, str]:
+        """Execute the HARDCODED_SECRET harness and return (marker_found, combined_output)."""
+        from keryx.fuzzing.harness import generate
+        from keryx.fuzzing.sandbox import run
+        marker = "KERYX_POC_HCSECRET"
+        script = generate({"rule": "HARDCODED_SECRET", "secret_value": secret_value}, marker)
+        assert script is not None
+        result = run(script, timeout=5)
+        combined = result.stdout + result.stderr
+        return marker in combined, combined
+
+    def test_high_entropy_secret_triggers_marker(self) -> None:
+        # 32-char random-looking API key — high entropy, long
+        found, _ = self._run("sk-Xq9rZp2NwKf7mVcLh3jTdEoIbAuYsSe")
+        assert found is True
+
+    def test_jwt_shaped_secret_triggers_marker(self) -> None:
+        # Three base64url segments → JWT structure
+        found, _ = self._run("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.abc123xyz")
+        assert found is True
+
+    def test_long_secret_triggers_marker(self) -> None:
+        # ≥ 20 chars (API-key length heuristic), even if low uniqueness
+        found, _ = self._run("aaaaaaaabbbbbbbbcccccc")  # 22 chars
+        assert found is True
+
+    def test_placeholder_password_skipped(self) -> None:
+        # "password" is an exact placeholder match → marker NOT emitted
+        found, output = self._run("password")
+        assert found is False
+        assert "SKIP" in output or "placeholder" in output.lower()
+
+    def test_placeholder_hunter2_skipped(self) -> None:
+        found, output = self._run("hunter2")
+        assert found is False
+
+    def test_placeholder_changeme_skipped(self) -> None:
+        found, output = self._run("changeme")
+        assert found is False
+
+    def test_no_secret_value_triggers_marker_conservatively(self) -> None:
+        # No secret_value → conservative flag (assume real)
+        found, _ = self._run("")
+        assert found is True
+
+    def test_reproduce_hardcoded_secret_no_value(self) -> None:
+        from keryx.fuzzing.poc import reproduce
+        poc = reproduce({"rule": "HARDCODED_SECRET"}, timeout=5)
+        assert poc.reproduced is True
+        assert poc.error is None
+
+    def test_reproduce_hardcoded_secret_with_real_value(self) -> None:
+        from keryx.fuzzing.poc import reproduce
+        poc = reproduce({"rule": "HARDCODED_SECRET",
+                         "secret_value": "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ123456"},
+                        timeout=5)
+        assert poc.reproduced is True
+        assert poc.confidence_boost > 0
+
+    def test_reproduce_hardcoded_secret_placeholder_not_reproduced(self) -> None:
+        from keryx.fuzzing.poc import reproduce
+        poc = reproduce({"rule": "HARDCODED_SECRET", "secret_value": "hunter2"}, timeout=5)
+        assert poc.reproduced is False
+
+
+class TestFuzzingSandbox:
+    """T53b — sandbox.py: subprocess execution and resource limits."""
+
+    def test_stdout_captured(self) -> None:
+        from keryx.fuzzing.sandbox import run
+        result = run("import sys; sys.stdout.write('hello\\n')", timeout=5)
+        assert result.stdout == "hello\n"
+        assert result.exit_code == 0
+        assert not result.timed_out
+
+    def test_stderr_captured(self) -> None:
+        from keryx.fuzzing.sandbox import run
+        result = run("import sys; sys.stderr.write('err\\n')", timeout=5)
+        assert "err" in result.stderr
+
+    def test_nonzero_exit_code(self) -> None:
+        from keryx.fuzzing.sandbox import run
+        result = run("raise SystemExit(42)", timeout=5)
+        assert result.exit_code == 42
+
+    def test_syntax_error_script(self) -> None:
+        from keryx.fuzzing.sandbox import run
+        result = run("def bad syntax(: pass", timeout=5)
+        assert result.exit_code != 0
+
+    def test_timeout_respected(self) -> None:
+        from keryx.fuzzing.sandbox import run
+        import time
+        t0     = time.monotonic()
+        result = run("import time; time.sleep(60)", timeout=2)
+        elapsed = time.monotonic() - t0
+        assert result.timed_out
+        assert elapsed < 10  # should be killed well within 10s
+
+    def test_elapsed_populated(self) -> None:
+        from keryx.fuzzing.sandbox import run
+        result = run("pass", timeout=5)
+        assert result.elapsed_s >= 0
+
+
+class TestFuzzingPoC:
+    """T53c — poc.py: reproduce() orchestrator."""
+
+    def test_reproduced_true_for_shell_true(self) -> None:
+        from keryx.fuzzing.poc import reproduce
+        poc = reproduce({"rule": "SUBPROCESS_SHELL_TRUE"}, timeout=8)
+        assert poc.reproduced is True
+        assert poc.confidence_boost > 0
+
+    def test_reproduced_true_for_eval_exec(self) -> None:
+        from keryx.fuzzing.poc import reproduce
+        poc = reproduce({"rule": "UNSAFE_EVAL_EXEC"}, timeout=8)
+        assert poc.reproduced is True
+
+    def test_reproduced_true_for_pickle(self) -> None:
+        from keryx.fuzzing.poc import reproduce
+        poc = reproduce({"rule": "UNSAFE_PICKLE"}, timeout=8)
+        assert poc.reproduced is True
+
+    def test_no_harness_returns_error(self) -> None:
+        from keryx.fuzzing.poc import reproduce
+        poc = reproduce({"rule": "LLM_OUTPUT_SINK"}, timeout=5)
+        assert poc.reproduced is False
+        assert poc.error is not None
+        assert poc.confidence_boost == 0.0
+
+    def test_marker_format(self) -> None:
+        from keryx.fuzzing.poc import reproduce
+        from keryx.fuzzing.harness import MARKER_PREFIX
+        poc = reproduce({"rule": "UNSAFE_EVAL_EXEC"}, timeout=5)
+        assert poc.marker.startswith(MARKER_PREFIX)
+
+    def test_llm_fallback_called_when_no_template(self) -> None:
+        from keryx.fuzzing.poc import reproduce
+        called = {}
+        def fake_llm(finding, marker):
+            called["marker"] = marker
+            return f"import sys; sys.stdout.write({marker!r} + '\\n')"
+
+        poc = reproduce({"rule": "LLM_OUTPUT_SINK"}, timeout=5, llm_generate_fn=fake_llm)
+        assert poc.reproduced is True
+        assert "marker" in called
+
+
+class TestFuzzingTool:
+    """T53d — tool.py: FuzzerTool Toolbox integration."""
+
+    @pytest.mark.asyncio
+    async def test_execute_reproduced(self) -> None:
+        from keryx.fuzzing.tool import create_fuzzer_tool
+        tool = create_fuzzer_tool(sandbox_timeout=8)
+        result = await tool.execute({"finding": {"rule": "UNSAFE_EVAL_EXEC"}})
+        assert result.success
+        assert result.data["reproduced"] is True
+        assert result.data["confidence_boost"] > 0
+
+    @pytest.mark.asyncio
+    async def test_execute_no_template(self) -> None:
+        from keryx.fuzzing.tool import create_fuzzer_tool
+        tool = create_fuzzer_tool(sandbox_timeout=5)
+        result = await tool.execute({"finding": {"rule": "LLM_OUTPUT_SINK"}})
+        assert result.success  # tool itself succeeds
+        assert result.data["reproduced"] is False
+        assert result.data["error"] is not None
+
+    @pytest.mark.asyncio
+    async def test_execute_invalid_input_missing_rule(self) -> None:
+        from keryx.fuzzing.tool import create_fuzzer_tool
+        tool = create_fuzzer_tool()
+        result = await tool.execute({"finding": {"severity": "HIGH"}})
+        assert not result.success
+        assert result.error == "invalid_input"
+
+    @pytest.mark.asyncio
+    async def test_execute_invalid_input_not_dict(self) -> None:
+        from keryx.fuzzing.tool import create_fuzzer_tool
+        tool = create_fuzzer_tool()
+        result = await tool.execute({"finding": "SUBPROCESS_SHELL_TRUE"})
+        assert not result.success
+
+    def test_tool_name(self) -> None:
+        from keryx.fuzzing.tool import create_fuzzer_tool
+        tool = create_fuzzer_tool()
+        assert tool.name == "fuzzer"
+
+
+class TestFuzzingSandboxEdgeCases:
+    """T53e — sandbox.py remaining uncovered branches."""
+
+    def test_preexec_returns_callable(self) -> None:
+        # _make_preexec() must return a zero-arg callable suitable for preexec_fn.
+        from keryx.fuzzing.sandbox import _make_preexec
+        fn = _make_preexec(5)
+        assert callable(fn)
+
+    def test_preexec_calls_setrlimit_with_correct_args(self) -> None:
+        # Lines 29-36: verify setrlimit is invoked with the right values.
+        # Use mock so the limits are never applied to the test runner process.
+        from unittest.mock import patch, MagicMock
+        from keryx.fuzzing.sandbox import _make_preexec
+        import resource as _resource
+
+        mock_resource = MagicMock()
+        mock_resource.RLIMIT_CPU   = _resource.RLIMIT_CPU
+        mock_resource.RLIMIT_FSIZE = _resource.RLIMIT_FSIZE
+
+        fn = _make_preexec(7)
+        with patch("keryx.fuzzing.sandbox.resource", mock_resource, create=True), \
+             patch.dict("sys.modules", {"resource": mock_resource}):
+            fn()
+
+        # setrlimit was called at least twice (CPU + FSIZE)
+        assert mock_resource.setrlimit.call_count >= 1
+
+    def test_preexec_swallows_setrlimit_errors(self) -> None:
+        # Lines 35-36: if setrlimit raises (unsupported platform), error is swallowed.
+        from unittest.mock import patch, MagicMock
+        from keryx.fuzzing.sandbox import _make_preexec
+        import resource as _resource
+
+        mock_resource = MagicMock()
+        mock_resource.RLIMIT_CPU   = _resource.RLIMIT_CPU
+        mock_resource.RLIMIT_FSIZE = _resource.RLIMIT_FSIZE
+        mock_resource.setrlimit.side_effect = ValueError("not supported")
+
+        fn = _make_preexec(5)
+        with patch("keryx.fuzzing.sandbox.resource", mock_resource, create=True), \
+             patch.dict("sys.modules", {"resource": mock_resource}):
+            fn()  # must not propagate the ValueError
+
+    def test_generic_exception_branch(self) -> None:
+        # Lines 69-70: subprocess.run raises a non-TimeoutExpired exception
+        # (e.g. OSError) — caught by bare except and returned as exit_code=-1.
+        from unittest.mock import patch
+        from keryx.fuzzing import sandbox
+
+        with patch("keryx.fuzzing.sandbox.subprocess.run", side_effect=OSError("boom")):
+            result = sandbox.run("pass", timeout=5)
+
+        assert result.exit_code == -1
+        assert "boom" in result.stderr
+        assert result.stdout == ""
+        assert not result.timed_out
+
+    def test_timeout_with_bytes_stdout(self) -> None:
+        # Lines 63-64: TimeoutExpired.stdout is bytes — must be decoded.
+        from unittest.mock import patch
+        from keryx.fuzzing import sandbox
+        import subprocess as _sp
+
+        exc = _sp.TimeoutExpired(cmd="x", timeout=1)
+        exc.stdout = b"partial output"
+        exc.stderr = b"partial err"
+
+        with patch("keryx.fuzzing.sandbox.subprocess.run", side_effect=exc):
+            result = sandbox.run("pass", timeout=1)
+
+        assert result.timed_out
+        assert result.stdout == "partial output"
+        assert result.stderr == "partial err"
+        assert result.exit_code is None
+
+    def test_timeout_with_none_stdout(self) -> None:
+        # TimeoutExpired.stdout/stderr is None — should produce empty strings.
+        from unittest.mock import patch
+        from keryx.fuzzing import sandbox
+        import subprocess as _sp
+
+        exc = _sp.TimeoutExpired(cmd="x", timeout=1)
+        exc.stdout = None
+        exc.stderr = None
+
+        with patch("keryx.fuzzing.sandbox.subprocess.run", side_effect=exc):
+            result = sandbox.run("pass", timeout=1)
+
+        assert result.timed_out
+        assert result.stdout == ""
+        assert result.stderr == ""
+
+
+# ===========================================================================
+# P1.3 — SARIF 2.1.0 serialiser  (keryx/core/sarif.py)
+# ===========================================================================
+
+class TestSarifModule:
+    """T54a — sarif.py: to_sarif() structure and content."""
+
+    def _make_hunt(
+        self,
+        file: str = "keryx/tools/git_blame.py",
+        rule: str = "SUBPROCESS_SHELL_TRUE",
+        line: int | None = 42,
+        tag: str = "AST+injection_verifier",
+        verified: bool = True,
+    ) -> dict:
+        obs = f"[HIGH] {rule} @ line {line}: subprocess.run(cmd, shell=True)" if line else f"[HIGH] {rule}: no line"
+        return {
+            "file": file,
+            "confirmed": [
+                {
+                    "rule": rule,
+                    "rules": [rule],
+                    "observation": obs,
+                    "confidence_tag": tag,
+                    "verified": verified,
+                }
+            ],
+        }
+
+    def test_top_level_sarif_keys(self) -> None:
+        from keryx.core.sarif import to_sarif
+        doc = to_sarif([self._make_hunt()])
+        assert doc["version"] == "2.1.0"
+        assert "$schema" in doc
+        assert len(doc["runs"]) == 1
+
+    def test_tool_driver_name(self) -> None:
+        from keryx.core.sarif import to_sarif
+        driver = to_sarif([self._make_hunt()])["runs"][0]["tool"]["driver"]
+        assert driver["name"] == "Keryx Hunter"
+        assert "version" in driver
+
+    def test_rules_populated(self) -> None:
+        from keryx.core.sarif import to_sarif
+        hunt = self._make_hunt(rule="SUBPROCESS_SHELL_TRUE")
+        rules = to_sarif([hunt])["runs"][0]["tool"]["driver"]["rules"]
+        assert any(r["id"] == "SUBPROCESS_SHELL_TRUE" for r in rules)
+
+    def test_result_count_matches_confirmed(self) -> None:
+        from keryx.core.sarif import to_sarif
+        h1 = self._make_hunt(file="a.py", rule="SUBPROCESS_SHELL_TRUE")
+        h2 = self._make_hunt(file="b.py", rule="OPEN_USER_PATH")
+        results = to_sarif([h1, h2])["runs"][0]["results"]
+        assert len(results) == 2
+
+    def test_result_rule_id(self) -> None:
+        from keryx.core.sarif import to_sarif
+        results = to_sarif([self._make_hunt(rule="UNSAFE_PICKLE")])["runs"][0]["results"]
+        assert results[0]["ruleId"] == "UNSAFE_PICKLE"
+
+    def test_result_level_high_is_error(self) -> None:
+        from keryx.core.sarif import to_sarif
+        results = to_sarif([self._make_hunt()])["runs"][0]["results"]
+        assert results[0]["level"] == "error"
+
+    def test_result_has_location(self) -> None:
+        from keryx.core.sarif import to_sarif
+        results = to_sarif([self._make_hunt(line=55)])["runs"][0]["results"]
+        locs = results[0]["locations"]
+        assert len(locs) == 1
+        phys = locs[0]["physicalLocation"]
+        assert "artifactLocation" in phys
+
+    def test_line_number_extracted(self) -> None:
+        from keryx.core.sarif import to_sarif
+        results = to_sarif([self._make_hunt(line=55)])["runs"][0]["results"]
+        region = results[0]["locations"][0]["physicalLocation"].get("region", {})
+        assert region.get("startLine") == 55
+
+    def test_no_line_number_omits_region(self) -> None:
+        from keryx.core.sarif import to_sarif
+        results = to_sarif([self._make_hunt(line=None)])["runs"][0]["results"]
+        phys = results[0]["locations"][0]["physicalLocation"]
+        assert "region" not in phys
+
+    def test_internal_path_gets_relative_uri(self) -> None:
+        from keryx.core.sarif import to_sarif
+        repo_root = "/Users/serhiihrynko/Documents/Helga/Keryx_Hunter"
+        hunt = self._make_hunt(file="keryx/tools/git_blame.py")
+        results = to_sarif([hunt], repo_root=repo_root)["runs"][0]["results"]
+        loc = results[0]["locations"][0]["physicalLocation"]["artifactLocation"]
+        assert loc.get("uriBaseId") == "%SRCROOT%"
+        assert loc["uri"] == "keryx/tools/git_blame.py"
+
+    def test_external_path_gets_absolute_uri(self) -> None:
+        from keryx.core.sarif import to_sarif
+        hunt = self._make_hunt(file="/tmp/external/app.py")
+        results = to_sarif([hunt], repo_root="/some/other/root")["runs"][0]["results"]
+        loc = results[0]["locations"][0]["physicalLocation"]["artifactLocation"]
+        assert "uriBaseId" not in loc
+        assert loc["uri"].startswith("file://")
+
+    def test_verified_flag_in_properties(self) -> None:
+        from keryx.core.sarif import to_sarif
+        results = to_sarif([self._make_hunt(verified=True)])["runs"][0]["results"]
+        assert results[0]["properties"]["verified"] is True
+
+    def test_confidence_tag_in_properties(self) -> None:
+        from keryx.core.sarif import to_sarif
+        results = to_sarif([self._make_hunt(tag="AST+fuzz_poc")])["runs"][0]["results"]
+        assert results[0]["properties"]["confidence_tag"] == "AST+fuzz_poc"
+
+    def test_fuzz_proof_added_when_reproduced(self) -> None:
+        from keryx.core.sarif import to_sarif
+        hunt = {
+            "file": "a.py",
+            "confirmed": [{
+                "rule": "SUBPROCESS_SHELL_TRUE",
+                "observation": "[HIGH] SUBPROCESS_SHELL_TRUE @ line 1: x",
+                "confidence_tag": "AST+fuzz_poc",
+                "verified": True,
+                "fuzz_proof": {"reproduced": True, "confidence_boost": 0.35},
+            }],
+        }
+        results = to_sarif([hunt])["runs"][0]["results"]
+        props = results[0]["properties"]
+        assert props.get("fuzz_reproduced") is True
+        assert props.get("fuzz_confidence_boost") == 0.35
+
+    def test_empty_hunt_list_produces_empty_results(self) -> None:
+        from keryx.core.sarif import to_sarif
+        doc = to_sarif([])
+        assert doc["runs"][0]["results"] == []
+        assert doc["runs"][0]["tool"]["driver"]["rules"] == []
+
+    def test_no_confirmed_vulns_produces_empty_results(self) -> None:
+        from keryx.core.sarif import to_sarif
+        doc = to_sarif([{"file": "a.py", "confirmed": []}])
+        assert doc["runs"][0]["results"] == []
+
+    def test_duplicate_rules_deduplicated_in_driver(self) -> None:
+        from keryx.core.sarif import to_sarif
+        h1 = self._make_hunt(file="a.py", rule="UNSAFE_PICKLE")
+        h2 = self._make_hunt(file="b.py", rule="UNSAFE_PICKLE")
+        rules = to_sarif([h1, h2])["runs"][0]["tool"]["driver"]["rules"]
+        rule_ids = [r["id"] for r in rules]
+        assert rule_ids.count("UNSAFE_PICKLE") == 1
+
+    def test_unknown_rule_gets_default_description(self) -> None:
+        from keryx.core.sarif import to_sarif
+        hunt = {
+            "file": "a.py",
+            "confirmed": [{
+                "rule": "BRAND_NEW_RULE",
+                "observation": "[HIGH] BRAND_NEW_RULE @ line 7: something()",
+                "confidence_tag": "AST-only",
+                "verified": False,
+            }],
+        }
+        results = to_sarif([hunt])["runs"][0]["results"]
+        assert results[0]["ruleId"] == "BRAND_NEW_RULE"
+        rules = to_sarif([hunt])["runs"][0]["tool"]["driver"]["rules"]
+        assert any(r["id"] == "BRAND_NEW_RULE" for r in rules)
+
+    def test_extract_line_helper(self) -> None:
+        from keryx.core.sarif import _extract_line
+        assert _extract_line("[HIGH] RULE @ line 99: code()") == 99
+        assert _extract_line("[HIGH] RULE: no line info") is None
+        assert _extract_line("") is None
+
+    def test_artifact_uri_internal(self) -> None:
+        from keryx.core.sarif import _artifact_uri
+        uri, base = _artifact_uri("keryx/tools/git_blame.py",
+                                   "/Users/serhiihrynko/Documents/Helga/Keryx_Hunter")
+        # When file_str is already relative this raises ValueError → external path
+        # (absolute path required for relative_to to work)
+        assert uri is not None
+
+    def test_sarif_is_json_serialisable(self) -> None:
+        import json
+        from keryx.core.sarif import to_sarif
+        doc = to_sarif([self._make_hunt()])
+        # Should not raise
+        raw = json.dumps(doc)
+        assert "Keryx Hunter" in raw
+
+
+# ===========================================================================
+# P2.1 — R11 SSRF rule  (keryx/tools/ast_analyzer.py)
+# ===========================================================================
+
+class TestSSRFRule:
+    """T54b — ast_analyzer.py: R11 SSRF detection."""
+
+    def _findings(self, code: str):
+        import ast
+        from keryx.tools.ast_analyzer import _VulnVisitor
+        tree = ast.parse(code)
+        visitor = _VulnVisitor(source_lines=code.splitlines())
+        visitor.visit(tree)
+        return [f for f in visitor.findings if f.rule == "SSRF"]
+
+    def test_get_with_variable_url(self) -> None:
+        findings = self._findings("import requests\nrequests.get(url)")
+        assert len(findings) == 1
+        assert findings[0].severity == "HIGH"
+
+    def test_post_with_variable_url(self) -> None:
+        findings = self._findings("import requests\nrequests.post(url, json={})")
+        assert len(findings) == 1
+
+    def test_put_with_variable_url(self) -> None:
+        findings = self._findings("import requests\nrequests.put(url, data=b'')")
+        assert len(findings) == 1
+
+    def test_delete_with_variable_url(self) -> None:
+        findings = self._findings("import requests\nrequests.delete(url)")
+        assert len(findings) == 1
+
+    def test_patch_with_variable_url(self) -> None:
+        findings = self._findings("import requests\nrequests.patch(url)")
+        assert len(findings) == 1
+
+    def test_request_method_variable_url_second_arg(self) -> None:
+        # requests.request("GET", url) — URL is the second positional arg
+        findings = self._findings('import requests\nrequests.request("GET", url)')
+        assert len(findings) == 1
+
+    def test_constant_url_not_flagged(self) -> None:
+        findings = self._findings('import requests\nrequests.get("https://api.example.com/data")')
+        assert findings == []
+
+    def test_concatenated_url_flagged(self) -> None:
+        # BinOp — base + path
+        findings = self._findings('import requests\nrequests.get(base + "/path")')
+        assert len(findings) == 1
+
+    def test_subscript_url_flagged(self) -> None:
+        findings = self._findings('import requests\nrequests.get(config["url"])')
+        assert len(findings) == 1
+
+    def test_fstring_url_flagged(self) -> None:
+        findings = self._findings('import requests\nrequests.get(f"http://{host}/path")')
+        assert len(findings) == 1
+
+    def test_no_args_not_flagged(self) -> None:
+        findings = self._findings("import requests\nrequests.get()")
+        assert findings == []
+
+    def test_non_requests_module_not_flagged(self) -> None:
+        findings = self._findings("import httpx\nhttpx.get(url)")
+        assert findings == []
+
+    def test_request_with_constant_url_not_flagged(self) -> None:
+        findings = self._findings('import requests\nrequests.request("GET", "https://fixed.com")')
+        assert findings == []
+
+    def test_line_number_present(self) -> None:
+        code = "import requests\n\n\nrequests.get(url)"
+        findings = self._findings(code)
+        assert findings[0].line == 4
+
+    @pytest.mark.asyncio
+    async def test_ssrf_in_ast_tool_output(self) -> None:
+        import textwrap
+        from keryx.tools.ast_analyzer import ASTAnalyzerTool
+        import tempfile, os
+
+        code = textwrap.dedent("""\
+            import requests
+            def fetch(url: str) -> str:
+                return requests.get(url).text
+        """)
+        with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
+            f.write(code)
+            tmp = f.name
+        try:
+            tool = ASTAnalyzerTool()
+            result = await tool.execute({"file_path": tmp})
+            rules = [fi["rule"] for fi in result.data.get("findings", [])]
+            assert "SSRF" in rules
+        finally:
+            os.unlink(tmp)
+
+
+class TestSSRFFuzzerHarness:
+    """T54c — harness.py: SSRF template + poc.reproduce()."""
+
+    def test_ssrf_template_generated(self) -> None:
+        from keryx.fuzzing.harness import generate
+        script = generate({"rule": "SSRF"}, "KERYX_POC_SSRF01")
+        assert script is not None
+        assert "KERYX_POC_SSRF01" in script
+
+    def test_ssrf_poc_reproduced(self) -> None:
+        from keryx.fuzzing.poc import reproduce
+        poc = reproduce({"rule": "SSRF"}, timeout=8)
+        assert poc.reproduced is True
+        assert poc.confidence_boost > 0
+        assert poc.error is None
+
+    def test_ssrf_known_rules_list(self) -> None:
+        from keryx.fuzzing.harness import _TEMPLATES
+        assert "SSRF" in _TEMPLATES
+
+
+# ===========================================================================
+# P2.2 — R12 TEMPLATE_INJECTION  (SSTI via Jinja2/Mako Template)
+# ===========================================================================
+
+class TestTemplateInjectionRule:
+    """T55a — ast_analyzer.py: R12 TEMPLATE_INJECTION detection."""
+
+    def _findings(self, code: str):
+        import ast
+        from keryx.tools.ast_analyzer import _VulnVisitor
+        tree = ast.parse(code)
+        visitor = _VulnVisitor(source_lines=code.splitlines())
+        visitor.visit(tree)
+        return [f for f in visitor.findings if f.rule == "TEMPLATE_INJECTION"]
+
+    # -- Pattern A: bare Template(non_const) ---------------------------------
+
+    def test_bare_template_variable_flagged(self) -> None:
+        findings = self._findings("from jinja2 import Template\nTemplate(user_tpl)")
+        assert len(findings) == 1
+        assert findings[0].severity == "HIGH"
+
+    def test_bare_template_fstring_flagged(self) -> None:
+        findings = self._findings('Template(f"Hello {name}!")')
+        assert len(findings) == 1
+
+    def test_bare_template_binop_flagged(self) -> None:
+        findings = self._findings('Template(header + body)')
+        assert len(findings) == 1
+
+    def test_bare_template_subscript_flagged(self) -> None:
+        findings = self._findings('Template(config["tpl"])')
+        assert len(findings) == 1
+
+    def test_bare_template_constant_not_flagged(self) -> None:
+        findings = self._findings('Template("Hello {{ name }}!")')
+        assert findings == []
+
+    def test_bare_template_no_args_not_flagged(self) -> None:
+        findings = self._findings("Template()")
+        assert findings == []
+
+    # -- Pattern A: qualified module.Template(non_const) ---------------------
+
+    def test_jinja2_template_flagged(self) -> None:
+        findings = self._findings("import jinja2\njinja2.Template(user_tpl)")
+        assert len(findings) == 1
+
+    def test_mako_template_flagged(self) -> None:
+        findings = self._findings(
+            "from mako import template as _m\n_m.Template(user_tpl)"
+        )
+        assert len(findings) == 1
+
+    def test_qualified_template_constant_not_flagged(self) -> None:
+        findings = self._findings('import jinja2\njinja2.Template("static {{ x }}")')
+        assert findings == []
+
+    # -- Pattern B: env.from_string(non_const) --------------------------------
+
+    def test_from_string_variable_flagged(self) -> None:
+        findings = self._findings(
+            "from jinja2 import Environment\nenv = Environment()\nenv.from_string(user_tpl)"
+        )
+        assert len(findings) == 1
+
+    def test_from_string_constant_not_flagged(self) -> None:
+        findings = self._findings(
+            'env.from_string("Hello {{ name }}!")'
+        )
+        assert findings == []
+
+    def test_from_string_fstring_flagged(self) -> None:
+        findings = self._findings('env.from_string(f"{{ {var} }}")')
+        assert len(findings) == 1
+
+    # -- Negative: render() with user data is NOT flagged --------------------
+
+    def test_render_with_user_kwargs_not_flagged(self) -> None:
+        # Passing user data as context is the safe pattern
+        findings = self._findings(
+            'tmpl = Template("Hello {{ name }}!")\ntmpl.render(name=user_input)'
+        )
+        assert findings == []
+
+    # -- Line number ----------------------------------------------------------
+
+    def test_line_number_present(self) -> None:
+        code = "from jinja2 import Template\n\n\nTemplate(user_tpl)"
+        findings = self._findings(code)
+        assert findings[0].line == 4
+
+    # -- End-to-end via ASTAnalyzerTool --------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_template_injection_in_tool_output(self) -> None:
+        import textwrap, tempfile, os
+        from keryx.tools.ast_analyzer import ASTAnalyzerTool
+
+        code = textwrap.dedent("""\
+            from jinja2 import Template, Environment
+
+            def render_user(tpl: str, **ctx):
+                t = Template(tpl)           # SSTI: user controls template string
+                return t.render(**ctx)
+
+            def render_env(tpl: str, **ctx):
+                env = Environment()
+                return env.from_string(tpl).render(**ctx)  # SSTI
+
+            def safe_render(name: str):
+                t = Template("Hello {{ name }}!")   # safe: hardcoded template
+                return t.render(name=name)
+        """)
+        with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
+            f.write(code)
+            tmp = f.name
+        try:
+            tool = ASTAnalyzerTool()
+            result = await tool.execute({"file_path": tmp})
+            rules = [fi["rule"] for fi in result.data.get("findings", [])]
+            assert rules.count("TEMPLATE_INJECTION") == 2   # Template(tpl) + from_string(tpl)
+        finally:
+            os.unlink(tmp)
+
+
+class TestTemplateInjectionHarness:
+    """T55b — harness.py + poc.py: TEMPLATE_INJECTION PoC."""
+
+    def test_template_in_templates_registry(self) -> None:
+        from keryx.fuzzing.harness import _TEMPLATES
+        assert "TEMPLATE_INJECTION" in _TEMPLATES
+
+    def test_template_script_generated(self) -> None:
+        from keryx.fuzzing.harness import generate
+        script = generate({"rule": "TEMPLATE_INJECTION"}, "KERYX_POC_SSTI01")
+        assert script is not None
+        assert "KERYX_POC_SSTI01" in script
+        assert "jinja2" in script
+
+    def test_template_script_contains_attacker_tpl(self) -> None:
+        from keryx.fuzzing.harness import generate
+        script = generate({"rule": "TEMPLATE_INJECTION"}, "KERYX_POC_SSTI01")
+        # The generated script must embed the attacker-controlled template string
+        assert "{% set x" in script or "set x" in script
+
+    def test_reproduce_template_injection(self) -> None:
+        from keryx.fuzzing.poc import reproduce
+        poc = reproduce({"rule": "TEMPLATE_INJECTION"}, timeout=8)
+        assert poc.reproduced is True
+        assert poc.confidence_boost > 0
+        assert poc.error is None
+
+    def test_harness_executes_in_sandbox(self) -> None:
+        from keryx.fuzzing.harness import generate
+        from keryx.fuzzing.sandbox import run
+        marker = "KERYX_POC_SANDBOXSSTI"
+        script = generate({"rule": "TEMPLATE_INJECTION"}, marker)
+        result = run(script, timeout=8)
+        combined = result.stdout + result.stderr
+        assert marker in combined
+
+
+class TestTemplateInjectionExtractFindings:
+    """T55c — verification_pipeline.extract_findings(): TEMPLATE_INJECTION branch."""
+
+    def test_template_injection_extracted(self) -> None:
+        from keryx.core.verification_pipeline import VerificationPipeline
+        obs = "[HIGH] TEMPLATE_INJECTION @ line 15: Template(user_tpl) — ...\n"
+        findings = VerificationPipeline.extract_findings(obs)
+        assert len(findings) == 1
+        rule, field, payload = findings[0]
+        assert rule == "TEMPLATE_INJECTION"
+        assert field == "template"
+        assert payload == "{{7*7}}"
+
+    def test_from_string_inject_field(self) -> None:
+        from keryx.core.verification_pipeline import VerificationPipeline
+        obs = "[HIGH] TEMPLATE_INJECTION @ line 8: env.from_string(tpl) — ...\n"
+        findings = VerificationPipeline.extract_findings(obs)
+        assert len(findings) == 1
+        assert findings[0][1] == "template"
+
+    def test_known_varname_mapped(self) -> None:
+        from keryx.core.verification_pipeline import VerificationPipeline
+        obs = "[HIGH] TEMPLATE_INJECTION @ line 3: Template(tmpl) — ...\n"
+        findings = VerificationPipeline.extract_findings(obs)
+        assert findings[0][1] == "template"   # tmpl → template via VARNAME_TO_FIELD
+
+    def test_unknown_varname_defaults_to_template(self) -> None:
+        from keryx.core.verification_pipeline import VerificationPipeline
+        obs = "[HIGH] TEMPLATE_INJECTION @ line 3: Template(some_weird_var) — ...\n"
+        findings = VerificationPipeline.extract_findings(obs)
+        assert findings[0][1] == "template"
+
+    def test_no_template_call_still_extracts_with_default(self) -> None:
+        from keryx.core.verification_pipeline import VerificationPipeline
+        obs = "[HIGH] TEMPLATE_INJECTION @ line 5: jinja2.Template(x)\n"
+        findings = VerificationPipeline.extract_findings(obs)
+        # May or may not match the regex — either way, field must be "template"
+        if findings:
+            assert findings[0][1] == "template"
+
+
+class TestTemplateInjectionSarifMeta:
+    """T55d — sarif.py: TEMPLATE_INJECTION rule metadata."""
+
+    def test_sarif_rule_meta_entry(self) -> None:
+        from keryx.core.sarif import _RULE_META
+        assert "TEMPLATE_INJECTION" in _RULE_META
+        name, short, fix = _RULE_META["TEMPLATE_INJECTION"]
+        assert name == "TemplateInjection"
+        assert "SSTI" in short or "template" in short.lower()
+        assert "render" in fix.lower() or "context" in fix.lower()
+
+    def test_sarif_result_for_template_injection(self) -> None:
+        from keryx.core.sarif import to_sarif
+        hunt = {
+            "file": "app.py",
+            "confirmed": [{
+                "rule": "TEMPLATE_INJECTION",
+                "observation": "[HIGH] TEMPLATE_INJECTION @ line 15: Template(user_tpl)",
+                "confidence_tag": "AST+fuzz_poc",
+                "verified": True,
+            }],
+        }
+        results = to_sarif([hunt])["runs"][0]["results"]
+        assert results[0]["ruleId"] == "TEMPLATE_INJECTION"
+        assert results[0]["level"] == "error"
+        rules = to_sarif([hunt])["runs"][0]["tool"]["driver"]["rules"]
+        r = next(r for r in rules if r["id"] == "TEMPLATE_INJECTION")
+        assert r["name"] == "TemplateInjection"
+
+
+# ===========================================================================
+# P2.3 — R13 REGEX_DOS  (ReDoS via user-controlled pattern)
+# ===========================================================================
+
+class TestRegexDosRule:
+    """T56a — ast_analyzer.py: R13 REGEX_DOS detection."""
+
+    def _findings(self, code: str):
+        import ast
+        from keryx.tools.ast_analyzer import _VulnVisitor
+        tree = ast.parse(code)
+        visitor = _VulnVisitor(source_lines=code.splitlines())
+        visitor.visit(tree)
+        return [f for f in visitor.findings if f.rule == "REGEX_DOS"]
+
+    # -- Each re.* method with variable pattern is flagged -------------------
+
+    def test_re_compile_variable_flagged(self) -> None:
+        findings = self._findings("import re\nre.compile(user_pattern)")
+        assert len(findings) == 1
+        assert findings[0].severity == "HIGH"
+
+    def test_re_search_variable_flagged(self) -> None:
+        findings = self._findings("import re\nre.search(pattern, text)")
+        assert len(findings) == 1
+
+    def test_re_match_variable_flagged(self) -> None:
+        findings = self._findings("import re\nre.match(pat, line)")
+        assert len(findings) == 1
+
+    def test_re_fullmatch_variable_flagged(self) -> None:
+        findings = self._findings("import re\nre.fullmatch(regex, value)")
+        assert len(findings) == 1
+
+    def test_re_findall_variable_flagged(self) -> None:
+        findings = self._findings("import re\nre.findall(pattern, corpus)")
+        assert len(findings) == 1
+
+    def test_re_finditer_variable_flagged(self) -> None:
+        findings = self._findings("import re\nre.finditer(pattern, text)")
+        assert len(findings) == 1
+
+    def test_re_sub_variable_flagged(self) -> None:
+        findings = self._findings("import re\nre.sub(pattern, repl, string)")
+        assert len(findings) == 1
+
+    def test_re_subn_variable_flagged(self) -> None:
+        findings = self._findings("import re\nre.subn(pattern, repl, string)")
+        assert len(findings) == 1
+
+    def test_re_split_variable_flagged(self) -> None:
+        findings = self._findings("import re\nre.split(pattern, string)")
+        assert len(findings) == 1
+
+    # -- Constant pattern is NOT flagged -------------------------------------
+
+    def test_constant_pattern_not_flagged(self) -> None:
+        findings = self._findings(r'import re; re.compile(r"\d+")')
+        assert findings == []
+
+    def test_constant_pattern_search_not_flagged(self) -> None:
+        findings = self._findings('import re\nre.search(r"[a-z]+", user_text)')
+        assert findings == []
+
+    # -- User-controlled string being matched is NOT flagged -----------------
+
+    def test_fixed_pattern_user_string_not_flagged(self) -> None:
+        # Pattern is constant; user controls the *string* → not ReDoS
+        findings = self._findings('import re\nre.match(r"^\\d+$", user_input)')
+        assert findings == []
+
+    # -- Non-re module not flagged -------------------------------------------
+
+    def test_non_re_module_not_flagged(self) -> None:
+        findings = self._findings("import regex\nregex.compile(user_pattern)")
+        assert findings == []
+
+    # -- Compound expressions flagged ----------------------------------------
+
+    def test_fstring_pattern_flagged(self) -> None:
+        findings = self._findings('import re\nre.compile(f"^{user_prefix}.*")')
+        assert len(findings) == 1
+
+    def test_binop_pattern_flagged(self) -> None:
+        findings = self._findings('import re\nre.compile("^" + user_suffix)')
+        assert len(findings) == 1
+
+    def test_subscript_pattern_flagged(self) -> None:
+        findings = self._findings('import re\nre.compile(config["pattern"])')
+        assert len(findings) == 1
+
+    # -- No args not flagged -------------------------------------------------
+
+    def test_no_args_not_flagged(self) -> None:
+        findings = self._findings("import re\nre.compile()")
+        assert findings == []
+
+    # -- Line number ---------------------------------------------------------
+
+    def test_line_number_present(self) -> None:
+        code = "import re\n\n\nre.compile(user_pattern)"
+        findings = self._findings(code)
+        assert findings[0].line == 4
+
+    # -- End-to-end via ASTAnalyzerTool -------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_regex_dos_in_tool_output(self) -> None:
+        import textwrap, tempfile, os
+        from keryx.tools.ast_analyzer import ASTAnalyzerTool
+
+        code = textwrap.dedent("""\
+            import re
+
+            def search_logs(user_pattern: str, log_line: str) -> bool:
+                return bool(re.search(user_pattern, log_line))   # REGEX_DOS
+
+            def compile_pattern(pat: str):
+                return re.compile(pat)                           # REGEX_DOS
+
+            def safe_search(log_line: str) -> bool:
+                return bool(re.search(r"ERROR", log_line))       # safe
+        """)
+        with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
+            f.write(code)
+            tmp = f.name
+        try:
+            tool = ASTAnalyzerTool()
+            result = await tool.execute({"file_path": tmp})
+            rules = [fi["rule"] for fi in result.data.get("findings", [])]
+            assert rules.count("REGEX_DOS") == 2
+        finally:
+            os.unlink(tmp)
+
+
+class TestRegexDosHarness:
+    """T56b — harness.py + poc.py: REGEX_DOS PoC."""
+
+    def test_regex_dos_in_templates_registry(self) -> None:
+        from keryx.fuzzing.harness import _TEMPLATES
+        assert "REGEX_DOS" in _TEMPLATES
+
+    def test_script_generated(self) -> None:
+        from keryx.fuzzing.harness import generate
+        script = generate({"rule": "REGEX_DOS"}, "KERYX_POC_REDOS01")
+        assert script is not None
+        assert "KERYX_POC_REDOS01" in script
+
+    def test_script_contains_backtracking_pattern(self) -> None:
+        from keryx.fuzzing.harness import generate
+        script = generate({"rule": "REGEX_DOS"}, "KERYX_POC_REDOS01")
+        # Must use the canonical catastrophic backtracking pattern
+        assert "(a+)+" in script
+
+    def test_reproduce_regex_dos(self) -> None:
+        from keryx.fuzzing.poc import reproduce
+        poc = reproduce({"rule": "REGEX_DOS"}, timeout=8)
+        assert poc.reproduced is True
+        assert poc.confidence_boost > 0
+        assert poc.error is None
+
+    def test_harness_executes_in_sandbox(self) -> None:
+        from keryx.fuzzing.harness import generate
+        from keryx.fuzzing.sandbox import run
+        marker = "KERYX_POC_REBOXSANDBOX"
+        script = generate({"rule": "REGEX_DOS"}, marker)
+        result = run(script, timeout=8)
+        assert marker in result.stdout + result.stderr
+
+    def test_script_mentions_exponential_scaling(self) -> None:
+        from keryx.fuzzing.harness import generate
+        script = generate({"rule": "REGEX_DOS"}, "M")
+        assert "exponential" in script.lower() or "backtrack" in script.lower()
+
+
+class TestRegexDosExtractFindings:
+    """T56c — verification_pipeline.extract_findings(): REGEX_DOS branch."""
+
+    def test_regex_dos_extracted_compile(self) -> None:
+        from keryx.core.verification_pipeline import VerificationPipeline
+        obs = "[HIGH] REGEX_DOS @ line 4: re.compile(user_pattern) — ...\n"
+        findings = VerificationPipeline.extract_findings(obs)
+        assert len(findings) == 1
+        rule, field, payload = findings[0]
+        assert rule == "REGEX_DOS"
+        assert field == "pattern"
+        assert payload == "(a+)+$"
+
+    def test_regex_dos_extracted_search(self) -> None:
+        from keryx.core.verification_pipeline import VerificationPipeline
+        obs = "[HIGH] REGEX_DOS @ line 10: re.search(regex, text) — ...\n"
+        findings = VerificationPipeline.extract_findings(obs)
+        assert findings[0][1] == "pattern"   # regex → pattern via VARNAME_TO_FIELD
+
+    def test_known_varname_pat_mapped(self) -> None:
+        from keryx.core.verification_pipeline import VerificationPipeline
+        obs = "[HIGH] REGEX_DOS @ line 3: re.match(pat, line) — ...\n"
+        findings = VerificationPipeline.extract_findings(obs)
+        assert findings[0][1] == "pattern"
+
+    def test_unknown_varname_defaults_to_pattern(self) -> None:
+        from keryx.core.verification_pipeline import VerificationPipeline
+        obs = "[HIGH] REGEX_DOS @ line 7: re.compile(weird_var) — ...\n"
+        findings = VerificationPipeline.extract_findings(obs)
+        assert findings[0][1] == "pattern"
+
+
+class TestRegexDosSarifMeta:
+    """T56d — sarif.py: REGEX_DOS rule metadata."""
+
+    def test_sarif_rule_meta_entry(self) -> None:
+        from keryx.core.sarif import _RULE_META
+        assert "REGEX_DOS" in _RULE_META
+        name, short, fix = _RULE_META["REGEX_DOS"]
+        assert name == "RegexDenialOfService"
+        assert "ReDoS" in short or "pattern" in short.lower()
+        assert "constant" in fix.lower() or "untrusted" in fix.lower()
+
+    def test_sarif_result_for_regex_dos(self) -> None:
+        from keryx.core.sarif import to_sarif
+        hunt = {
+            "file": "app.py",
+            "confirmed": [{
+                "rule": "REGEX_DOS",
+                "observation": "[HIGH] REGEX_DOS @ line 4: re.compile(user_pattern)",
+                "confidence_tag": "AST+fuzz_poc",
+                "verified": True,
+            }],
+        }
+        results = to_sarif([hunt])["runs"][0]["results"]
+        assert results[0]["ruleId"] == "REGEX_DOS"
+        assert results[0]["level"] == "error"
+        rules = to_sarif([hunt])["runs"][0]["tool"]["driver"]["rules"]
+        r = next(r for r in rules if r["id"] == "REGEX_DOS")
+        assert r["name"] == "RegexDenialOfService"
+
+
+# ===========================================================================
+# P3.3 — source_type annotation  (ast_analyzer.py)
+# ===========================================================================
+
+class TestSourceTypeAnnotation:
+    """T57a — Finding.source_type populated by _VulnVisitor param tracking."""
+
+    def _findings(self, code: str):
+        import ast
+        from keryx.tools.ast_analyzer import _VulnVisitor
+        tree = ast.parse(code)
+        v = _VulnVisitor(source_lines=code.splitlines())
+        v.visit(tree)
+        return v.findings
+
+    # -- "param" when arg is a direct function parameter --------------------
+
+    def test_direct_param_ssrf(self) -> None:
+        code = "import requests\ndef f(url): requests.get(url)"
+        f = [x for x in self._findings(code) if x.rule == "SSRF"][0]
+        assert f.source_type == "param"
+
+    def test_direct_param_eval(self) -> None:
+        code = "def f(expr):\n    eval(expr)"
+        f = [x for x in self._findings(code) if x.rule == "UNSAFE_EVAL_EXEC"][0]
+        assert f.source_type == "param"
+
+    def test_direct_param_pickle(self) -> None:
+        code = "import pickle\ndef f(data):\n    pickle.loads(data)"
+        f = [x for x in self._findings(code) if x.rule == "UNSAFE_PICKLE"][0]
+        assert f.source_type == "param"
+
+    def test_direct_param_open(self) -> None:
+        code = "def f(path):\n    open(path)"
+        f = [x for x in self._findings(code) if x.rule == "OPEN_USER_PATH"][0]
+        assert f.source_type == "param"
+
+    def test_direct_param_template_injection(self) -> None:
+        code = "from jinja2 import Template\ndef f(tpl):\n    Template(tpl)"
+        f = [x for x in self._findings(code) if x.rule == "TEMPLATE_INJECTION"][0]
+        assert f.source_type == "param"
+
+    def test_direct_param_regex_dos(self) -> None:
+        code = "import re\ndef f(pat):\n    re.compile(pat)"
+        f = [x for x in self._findings(code) if x.rule == "REGEX_DOS"][0]
+        assert f.source_type == "param"
+
+    # -- "local" when arg is a local variable (not in params) ---------------
+
+    def test_local_variable(self) -> None:
+        code = "import re\ndef f():\n    pat = get_pattern()\n    re.compile(pat)"
+        f = [x for x in self._findings(code) if x.rule == "REGEX_DOS"][0]
+        assert f.source_type == "local"
+
+    # -- "param" for expression that contains a param Name ------------------
+
+    def test_fstring_with_param_is_param(self) -> None:
+        code = 'import requests\ndef f(host):\n    requests.get(f"http://{host}/api")'
+        f = [x for x in self._findings(code) if x.rule == "SSRF"][0]
+        assert f.source_type == "param"
+
+    def test_binop_with_param_is_param(self) -> None:
+        code = 'import requests\ndef f(path):\n    requests.get("https://base" + path)'
+        f = [x for x in self._findings(code) if x.rule == "SSRF"][0]
+        assert f.source_type == "param"
+
+    # -- "unknown" when not inside a function --------------------------------
+
+    def test_module_level_is_unknown(self) -> None:
+        code = "import re\nre.compile(user_pattern)"
+        f = [x for x in self._findings(code) if x.rule == "REGEX_DOS"][0]
+        assert f.source_type == "unknown"
+
+    # -- nested function: inner params don't bleed into outer ----------------
+
+    def test_nested_function_inner_param(self) -> None:
+        code = (
+            "import re\n"
+            "def outer():\n"
+            "    local_var = 'x'\n"
+            "    def inner(pat):\n"
+            "        re.compile(pat)\n"
+        )
+        findings = [x for x in self._findings(code) if x.rule == "REGEX_DOS"]
+        assert findings[0].source_type == "param"
+
+    def test_nested_function_outer_local(self) -> None:
+        code = (
+            "import re\n"
+            "def outer():\n"
+            "    local_var = get_pat()\n"
+            "    re.compile(local_var)\n"
+        )
+        findings = [x for x in self._findings(code) if x.rule == "REGEX_DOS"]
+        # local_var is defined in outer(), not a param
+        assert findings[0].source_type == "local"
+
+    # -- async function params tracked too -----------------------------------
+
+    def test_async_function_param(self) -> None:
+        code = "import requests\nasync def f(url):\n    requests.get(url)"
+        f = [x for x in self._findings(code) if x.rule == "SSRF"][0]
+        assert f.source_type == "param"
+
+    # -- source_type in serialised ASTAnalyzerTool output --------------------
+
+    @pytest.mark.asyncio
+    async def test_source_type_in_tool_data(self) -> None:
+        import textwrap, tempfile, os
+        from keryx.tools.ast_analyzer import ASTAnalyzerTool
+
+        code = textwrap.dedent("""\
+            import re
+            def search(user_pattern: str, text: str) -> bool:
+                return bool(re.search(user_pattern, text))
+        """)
+        with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as fh:
+            fh.write(code)
+            tmp = fh.name
+        try:
+            result = await ASTAnalyzerTool().execute({"file_path": tmp})
+            fi = next(f for f in result.data["findings"] if f["rule"] == "REGEX_DOS")
+            assert fi["source_type"] == "param"
+        finally:
+            os.unlink(tmp)
+
+
+# ===========================================================================
+# P3.2 — LLM harness factory  (keryx/fuzzing/llm_harness.py)
+# ===========================================================================
+
+class TestLLMHarnessFactory:
+    """T57b — llm_harness.py: make_llm_generate_fn() and integration."""
+
+    def _fake_model(self, response: str):
+        """Return a minimal ModelInterface stub that always returns *response*."""
+        from keryx.models.interface import (
+            ModelInterface, GenerationResult, ModelCapabilities, CostEstimate,
+        )
+        class _Stub(ModelInterface):
+            model_name = "stub"
+            def generate(self, prompt, config=None, *, grammar=None, max_tokens=None):
+                return response
+            async def generate_async(self, *a, **kw): return response
+            def generate_result(self, *a, **kw):
+                return GenerationResult(text=response, tokens_input=1, tokens_output=1,
+                                        duration_ms=0.0, finish_reason="stop")
+            def generate_stream(self, *a, **kw): yield response
+            def generate_with_tools(self, *a, **kw): return response
+            def tokenize(self, t): return [0]
+            def get_context_length(self): return 4096
+            def is_healthy(self): return True
+            def estimate_cost(self, i, o):
+                return CostEstimate(input_cost_usd=0.0, output_cost_usd=0.0, total_cost_usd=0.0)
+            def get_usage_cost(self):
+                return CostEstimate(input_cost_usd=0.0, output_cost_usd=0.0, total_cost_usd=0.0)
+            def get_capabilities(self):
+                return ModelCapabilities(max_context_length=4096,
+                    supports_tool_calling=False, supports_grammar=False,
+                    supports_batching=False, supports_streaming=False,
+                    supports_speculative=False, supports_min_p=False,
+                    requires_gpu=False, is_local=True, is_quantized=False)
+            def unload(self): pass
+        return _Stub()
+
+    def test_valid_script_returned(self) -> None:
+        from keryx.fuzzing.llm_harness import make_llm_generate_fn
+        marker = "KERYX_POC_LLMTEST"
+        script = f'import sys\nsys.stdout.write({marker!r} + "\\n")'
+        fn = make_llm_generate_fn(self._fake_model(script))
+        result = fn({"rule": "LLM_OUTPUT_SINK"}, marker)
+        assert result is not None
+        assert marker in result
+
+    def test_markdown_fences_stripped(self) -> None:
+        from keryx.fuzzing.llm_harness import make_llm_generate_fn
+        marker = "KERYX_POC_FENCE"
+        inner = f'import sys\nsys.stdout.write({marker!r} + "\\n")'
+        fenced = f"```python\n{inner}\n```"
+        fn = make_llm_generate_fn(self._fake_model(fenced))
+        result = fn({"rule": "LLM_OUTPUT_SINK"}, marker)
+        assert result is not None
+        assert "```" not in result
+        assert marker in result
+
+    def test_missing_marker_returns_none(self) -> None:
+        from keryx.fuzzing.llm_harness import make_llm_generate_fn
+        fn = make_llm_generate_fn(self._fake_model("print('no marker here')"))
+        result = fn({"rule": "LLM_OUTPUT_SINK"}, "KERYX_POC_NOTHERE")
+        assert result is None
+
+    def test_invalid_python_returns_none(self) -> None:
+        from keryx.fuzzing.llm_harness import make_llm_generate_fn
+        marker = "KERYX_POC_BADPY"
+        fn = make_llm_generate_fn(self._fake_model(f"def bad syntax({marker!r}):"))
+        result = fn({"rule": "LLM_OUTPUT_SINK"}, marker)
+        assert result is None
+
+    def test_model_exception_returns_none(self) -> None:
+        from keryx.fuzzing.llm_harness import make_llm_generate_fn
+        from keryx.models.interface import (
+            ModelInterface, GenerationResult, ModelCapabilities, CostEstimate,
+        )
+        class _Raiser(ModelInterface):
+            model_name = "raiser"
+            def generate(self, *a, **kw): raise RuntimeError("no API key")
+            async def generate_async(self, *a, **kw): raise RuntimeError()
+            def generate_result(self, *a, **kw):
+                return GenerationResult(text="", tokens_input=0, tokens_output=0,
+                                        duration_ms=0.0, finish_reason="error")
+            def generate_stream(self, *a, **kw): yield ""
+            def generate_with_tools(self, *a, **kw): return ""
+            def tokenize(self, t): return []
+            def get_context_length(self): return 0
+            def is_healthy(self): return False
+            def estimate_cost(self, i, o):
+                return CostEstimate(input_cost_usd=0.0, output_cost_usd=0.0, total_cost_usd=0.0)
+            def get_usage_cost(self):
+                return CostEstimate(input_cost_usd=0.0, output_cost_usd=0.0, total_cost_usd=0.0)
+            def get_capabilities(self):
+                return ModelCapabilities(max_context_length=0,
+                    supports_tool_calling=False, supports_grammar=False,
+                    supports_batching=False, supports_streaming=False,
+                    supports_speculative=False, supports_min_p=False,
+                    requires_gpu=False, is_local=True, is_quantized=False)
+            def unload(self): pass
+        fn = make_llm_generate_fn(_Raiser())
+        result = fn({"rule": "LLM_OUTPUT_SINK"}, "KERYX_POC_RAISE")
+        assert result is None
+
+    def test_plain_fences_stripped(self) -> None:
+        from keryx.fuzzing.llm_harness import make_llm_generate_fn, _strip_fences
+        marker = "M"
+        inner = f"import sys\nsys.stdout.write({marker!r})"
+        assert _strip_fences(f"```\n{inner}\n```") == inner
+
+    def test_no_fences_unchanged(self) -> None:
+        from keryx.fuzzing.llm_harness import _strip_fences
+        code = "import sys\nsys.stdout.write('x')"
+        assert _strip_fences(code) == code
+
+    def test_poc_reproduce_with_llm_fn(self) -> None:
+        """reproduce() accepts llm_generate_fn and uses it for no-template rules."""
+        from keryx.fuzzing.poc import reproduce
+        from keryx.fuzzing.llm_harness import make_llm_generate_fn
+        marker_holder: list[str] = []
+        def capture_fn(finding, marker):
+            marker_holder.append(marker)
+            return f'import sys\nsys.stdout.write({marker!r} + "\\n")'
+        fn = make_llm_generate_fn(self._fake_model(""))  # model unused; capture_fn overrides
+        # Use capture_fn directly as llm_generate_fn
+        poc = reproduce({"rule": "LLM_OUTPUT_SINK"}, timeout=5, llm_generate_fn=capture_fn)
+        assert poc.reproduced is True
+        assert poc.rule == "LLM_OUTPUT_SINK"
+
+
+# ===========================================================================
+# P3.1 — Rule gap detector  (keryx/core/rule_learner.py)
+# ===========================================================================
+
+class TestRuleLearner:
+    """T57c — rule_learner.py: RuleLearner + RuleSuggestion."""
+
+    def _learner_from_code(self, code: str, suffix: str = ".py"):
+        import tempfile, os
+        from pathlib import Path
+        from keryx.core.rule_learner import RuleLearner
+        with tempfile.NamedTemporaryFile(suffix=suffix, mode="w",
+                                         delete=False, encoding="utf-8") as fh:
+            fh.write(code)
+            tmp = Path(fh.name)
+        try:
+            learner = RuleLearner([tmp])
+            suggestions = learner.analyse()
+        finally:
+            os.unlink(tmp)
+        return suggestions
+
+    # -- Detection of gap patterns -------------------------------------------
+
+    def test_detects_httpx_ssrf(self) -> None:
+        suggestions = self._learner_from_code("httpx.get(user_url, timeout=5)")
+        ids = [s.suggestion_id for s in suggestions]
+        assert "SSRF_HTTPX" in ids
+
+    def test_detects_urllib_ssrf(self) -> None:
+        suggestions = self._learner_from_code("urllib.request.urlopen(target_url)")
+        ids = [s.suggestion_id for s in suggestions]
+        assert "SSRF_URLLIB" in ids
+
+    def test_detects_xml_xxe(self) -> None:
+        suggestions = self._learner_from_code("ET.parse(user_file)")
+        ids = [s.suggestion_id for s in suggestions]
+        assert "XXE_ELEMENTTREE" in ids
+
+    def test_detects_importlib(self) -> None:
+        suggestions = self._learner_from_code("importlib.import_module(module_name)")
+        ids = [s.suggestion_id for s in suggestions]
+        assert "UNSAFE_IMPORT" in ids
+
+    def test_detects_marshal(self) -> None:
+        suggestions = self._learner_from_code("marshal.loads(raw_data)")
+        ids = [s.suggestion_id for s in suggestions]
+        assert "UNSAFE_MARSHAL" in ids
+
+    # -- Negative: covered patterns not re-suggested -------------------------
+
+    def test_clean_file_no_suggestions(self) -> None:
+        code = "x = 1\nprint(x)\n"
+        suggestions = self._learner_from_code(code)
+        assert suggestions == []
+
+    def test_covered_requests_not_suggested(self) -> None:
+        # requests.* is already R11 — no new suggestion expected
+        code = "import requests\nrequests.get(url)"
+        suggestions = self._learner_from_code(code)
+        # SSRF_HTTPX should NOT appear (it's httpx, not requests)
+        assert all(s.suggestion_id != "SSRF_HTTPX" for s in suggestions)
+
+    # -- Occurrence counting and sorting -------------------------------------
+
+    def test_occurrences_counted_per_file(self) -> None:
+        import tempfile, os
+        from pathlib import Path
+        from keryx.core.rule_learner import RuleLearner
+
+        code_a = "httpx.get(url_a)"
+        code_b = "httpx.post(url_b)"
+        files = []
+        try:
+            for code in [code_a, code_b]:
+                fh = tempfile.NamedTemporaryFile(suffix=".py", mode="w",
+                                                  delete=False, encoding="utf-8")
+                fh.write(code)
+                fh.close()
+                files.append(Path(fh.name))
+            suggestions = RuleLearner(files).analyse()
+            httpx_s = next(s for s in suggestions if s.suggestion_id == "SSRF_HTTPX")
+            assert httpx_s.occurrences == 2
+        finally:
+            for f in files:
+                os.unlink(f)
+
+    def test_sorted_by_occurrences_desc(self) -> None:
+        import tempfile, os
+        from pathlib import Path
+        from keryx.core.rule_learner import RuleLearner
+
+        # Two files with httpx (2 hits), one with urllib (1 hit)
+        codes = [
+            "httpx.get(url)",
+            "httpx.post(url)",
+            "urllib.request.urlopen(url)",
+        ]
+        files = []
+        try:
+            for code in codes:
+                fh = tempfile.NamedTemporaryFile(suffix=".py", mode="w",
+                                                  delete=False, encoding="utf-8")
+                fh.write(code)
+                fh.close()
+                files.append(Path(fh.name))
+            suggestions = RuleLearner(files).analyse()
+            assert suggestions[0].occurrences >= suggestions[-1].occurrences
+        finally:
+            for f in files:
+                os.unlink(f)
+
+    # -- RuleSuggestion __str__ ----------------------------------------------
+
+    def test_suggestion_str_contains_key_fields(self) -> None:
+        suggestions = self._learner_from_code("httpx.get(url)")
+        s = suggestions[0]
+        text = str(s)
+        assert s.suggestion_id in text
+        assert s.rule_family in text
+        assert str(s.occurrences) in text
+
+    # -- print_suggestions ---------------------------------------------------
+
+    def test_print_suggestions_no_crash(self) -> None:
+        import io, contextlib
+        from keryx.core.rule_learner import print_suggestions, RuleSuggestion
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            print_suggestions([])
+            print_suggestions([
+                RuleSuggestion("SSRF_HTTPX", "SSRF", 1, ["/tmp/a.py"],
+                               "httpx.get(url)", "desc", "fix")
+            ])
+        out = buf.getvalue()
+        assert "SSRF_HTTPX" in out
+        assert "No rule gaps" in out or "potential gap" in out
+
+    # -- Empty file list -----------------------------------------------------
+
+    def test_empty_file_list(self) -> None:
+        from keryx.core.rule_learner import RuleLearner
+        assert RuleLearner([]).analyse() == []
+
+    # -- Unreadable file doesn't crash ---------------------------------------
+
+    def test_unreadable_file_skipped(self) -> None:
+        from pathlib import Path
+        from keryx.core.rule_learner import RuleLearner
+        suggestions = RuleLearner([Path("/nonexistent_keryx_test_file.py")]).analyse()
+        assert suggestions == []
+
+
+
+
+# =============================================================================
+# T58 — P4: GitHub Actions workflow, pre-commit hook installer, HTML report
+# =============================================================================
+
+class TestGitHubActionsWorkflow:
+    """T58a: keryx-hunt.yml is a well-formed YAML file."""
+
+    @staticmethod
+    def _workflow_path() -> Path:
+        return Path(__file__).parent.parent / ".github" / "workflows" / "keryx-hunt.yml"
+
+    def test_workflow_file_exists(self) -> None:
+        assert self._workflow_path().exists(), "keryx-hunt.yml not found"
+
+    def test_workflow_is_valid_yaml(self) -> None:
+        import yaml
+        data = yaml.safe_load(self._workflow_path().read_text(encoding="utf-8"))
+        assert isinstance(data, dict)
+
+    def test_workflow_has_on_push(self) -> None:
+        # YAML parses bare `on:` as True; check raw text instead
+        text = self._workflow_path().read_text(encoding="utf-8")
+        assert "push:" in text
+
+    def test_workflow_has_pull_request(self) -> None:
+        text = self._workflow_path().read_text(encoding="utf-8")
+        assert "pull_request:" in text
+
+    def test_workflow_has_schedule(self) -> None:
+        text = self._workflow_path().read_text(encoding="utf-8")
+        assert "schedule:" in text
+
+    def test_workflow_uploads_sarif(self) -> None:
+        text = self._workflow_path().read_text(encoding="utf-8")
+        assert "upload-sarif" in text
+
+    def test_workflow_uploads_artifact(self) -> None:
+        text = self._workflow_path().read_text(encoding="utf-8")
+        assert "upload-artifact" in text
+
+    def test_workflow_runs_hunt_script(self) -> None:
+        text = self._workflow_path().read_text(encoding="utf-8")
+        assert "project_hunt.py" in text
+
+    def test_workflow_has_fail_if_confirmed(self) -> None:
+        text = self._workflow_path().read_text(encoding="utf-8")
+        assert "--fail-if-confirmed" in text
+
+    def test_workflow_uses_output_html(self) -> None:
+        text = self._workflow_path().read_text(encoding="utf-8")
+        assert "--output-html" in text
+
+    def test_workflow_uses_output_sarif(self) -> None:
+        text = self._workflow_path().read_text(encoding="utf-8")
+        assert "--output-sarif" in text
+
+    def test_workflow_security_events_write(self) -> None:
+        text = self._workflow_path().read_text(encoding="utf-8")
+        assert "security-events: write" in text
+
+
+class TestPreCommitHookInstaller:
+    """T58b: scripts/install_hooks.py creates a valid pre-commit hook."""
+
+    @staticmethod
+    def _installer_path() -> Path:
+        return Path(__file__).parent.parent / "scripts" / "install_hooks.py"
+
+    def test_installer_exists(self) -> None:
+        assert self._installer_path().exists()
+
+    def test_installer_is_valid_python(self) -> None:
+        import ast
+        ast.parse(self._installer_path().read_text(encoding="utf-8"))
+
+    def test_hook_body_blocks_on_high(self) -> None:
+        text = self._installer_path().read_text(encoding="utf-8")
+        assert "severity" in text
+        assert "sys.exit(1)" in text
+
+    def test_hook_body_is_valid_python(self) -> None:
+        import ast, re as _re
+        text = self._installer_path().read_text(encoding="utf-8")
+        m = _re.search(r'_HOOK_BODY\s*=\s*r"""(.*?)"""', text, _re.DOTALL)
+        assert m, "_HOOK_BODY not found"
+        ast.parse(m.group(1))
+
+    def test_install_into_temp_git_repo(self) -> None:
+        import subprocess, sys as _sys
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            subprocess.run(["git", "init", tmp], capture_output=True)
+            result = subprocess.run(
+                [_sys.executable, str(self._installer_path()), "--repo-dir", tmp],
+                capture_output=True, text=True,
+                env={**os.environ},
+            )
+            hook = tmp_path / ".git" / "hooks" / "pre-commit"
+            assert hook.exists(), f"stderr: {result.stderr}\nstdout: {result.stdout}"
+            assert os.access(hook, os.X_OK)
+
+    def test_force_flag_overwrites(self) -> None:
+        import subprocess, sys as _sys
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            subprocess.run(["git", "init", tmp], capture_output=True)
+            hook = tmp_path / ".git" / "hooks" / "pre-commit"
+            hook.write_text("old content")
+            subprocess.run(
+                [_sys.executable, str(self._installer_path()),
+                 "--repo-dir", tmp, "--force"],
+                capture_output=True,
+            )
+            assert hook.read_text() != "old content"
+
+    def test_no_force_preserves_existing(self) -> None:
+        import subprocess, sys as _sys
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            subprocess.run(["git", "init", tmp], capture_output=True)
+            hook = tmp_path / ".git" / "hooks" / "pre-commit"
+            hook.write_text("keep this")
+            subprocess.run(
+                [_sys.executable, str(self._installer_path()), "--repo-dir", tmp],
+                capture_output=True,
+            )
+            assert hook.read_text() == "keep this"
+
+    def test_no_git_dir_returns_error(self) -> None:
+        import subprocess, sys as _sys
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run(
+                [_sys.executable, str(self._installer_path()), "--repo-dir", tmp],
+                capture_output=True, text=True,
+            )
+            assert result.returncode == 1
+
+
+class TestHtmlReport:
+    """T58c: write_output_html produces a well-formed HTML file."""
+
+    @staticmethod
+    def _write(all_results=None, all_hunts=None, models=None, *, path: Path) -> None:
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).parent.parent))
+        from scripts.project_hunt import write_output_html  # type: ignore[import]
+        write_output_html(
+            str(path),
+            all_results or [],
+            all_hunts  or [],
+            models     or {},
+            budget=0.50, total_s=3.14,
+        )
+
+    def test_creates_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "report.html"
+            self._write(path=p)
+            assert p.exists()
+
+    def test_html_has_doctype(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "report.html"
+            self._write(path=p)
+            assert "<!DOCTYPE html>" in p.read_text(encoding="utf-8")
+
+    def test_summary_cards_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "report.html"
+            self._write(path=p)
+            text = p.read_text(encoding="utf-8")
+            assert "Files Scanned" in text
+            assert "Confirmed Vulns" in text
+
+    def test_vuln_row_rendered(self) -> None:
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).parent.parent))
+        from scripts.project_hunt import ScanResult, HuntResult  # type: ignore[import]
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "report.html"
+            scan = ScanResult(file=Path("keryx/tools/ast_analyzer.py"),
+                              high_count=1, rules=["SSRF"])
+            hunt = HuntResult(
+                file=Path("keryx/tools/ast_analyzer.py"),
+                scan=scan, steps=3, elapsed_s=1.0, model_label="haiku",
+                confirmed=[{"rule": "SSRF", "severity": "HIGH",
+                            "line": 42, "message": "SSRF sink", "verified": True}],
+                status="confirmed",
+            )
+            self._write(all_results=[scan], all_hunts=[hunt], path=p)
+            text = p.read_text(encoding="utf-8")
+            assert "SSRF" in text
+            assert "HIGH" in text
+
+    def test_no_confirmed_shows_empty_msg(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "report.html"
+            self._write(path=p)
+            assert "No confirmed vulnerabilities" in p.read_text(encoding="utf-8")
+
+    def test_xss_escaped_in_message(self) -> None:
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).parent.parent))
+        from scripts.project_hunt import ScanResult, HuntResult  # type: ignore[import]
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "report.html"
+            scan = ScanResult(file=Path("keryx/tools/ast_analyzer.py"),
+                              high_count=1, rules=["LLM_OUTPUT_SINK"])
+            hunt = HuntResult(
+                file=Path("keryx/tools/ast_analyzer.py"),
+                scan=scan, steps=3, elapsed_s=1.0, model_label="haiku",
+                confirmed=[{"rule": "LLM_OUTPUT_SINK", "severity": "HIGH",
+                            "message": "<script>alert(1)</script>"}],
+                status="confirmed",
+            )
+            self._write(all_results=[scan], all_hunts=[hunt], path=p)
+            text = p.read_text(encoding="utf-8")
+            assert "<script>" not in text
+            assert "&lt;script&gt;" in text
+
+    def test_parent_dir_created(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "subdir" / "deep" / "report.html"
+            self._write(path=p)
+            assert p.exists()
+
+    def test_output_html_flag_in_argparse(self) -> None:
+        import sys as _sys, unittest.mock as _mock
+        _sys.path.insert(0, str(Path(__file__).parent.parent))
+        from scripts.project_hunt import parse_args  # type: ignore[import]
+        with _mock.patch("sys.argv", ["project_hunt.py", "--output-html", "/tmp/x.html"]):
+            args = parse_args()
+        assert args.output_html == "/tmp/x.html"

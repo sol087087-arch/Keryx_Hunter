@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,6 +17,29 @@ from ..advisors.manager import AdvisorManager
 from ..core.shared_context import SharedContext
 from ..models.interface import ModelInterface
 from ..tools.Toolbox import ToolBox
+from ._budget import BudgetController
+from ._constants import (
+    ESCALATION_COOLDOWN,
+    MAX_HISTORY_STEPS,
+    OUTPUT_GRAMMAR,
+    TOOL_TIMEOUT_SECONDS,
+    VALID_ACTIONS,
+    VULN_CONFIRMING_TOOLS,
+)
+from ._loop_guards import check_exit_clean, observation_confirms_vuln
+from ._parser import extract_json, fallback_parse, parse_response
+from .verification_pipeline import VerificationPipeline
+
+# Re-export so existing callers (`from keryx.core.agent import BudgetController`) still work.
+__all__ = ["KeryxAgent", "AgentStep", "BudgetController"]
+
+# Patchable module-level aliases kept for backward compatibility.
+# Tests that do `agent_mod._TOOL_TIMEOUT_SECONDS = 0.05` or
+# `from keryx.core.agent import _ESCALATION_COOLDOWN` still work because
+# these names live in this module's __dict__ and are looked up as globals
+# at call time — not bound at import time.
+_ESCALATION_COOLDOWN:  int   = ESCALATION_COOLDOWN
+_TOOL_TIMEOUT_SECONDS: float = TOOL_TIMEOUT_SECONDS
 
 
 @dataclass
@@ -27,109 +51,6 @@ class AgentStep:
     observation:  str   = ""
     confidence:   float = 0.0
     timestamp:    float = field(default_factory=time.time)
-
-
-@dataclass
-class BudgetController:
-    """Track and enforce API/model budget for cloud models."""
-    max_cost_usd: float = 10.0
-    current_cost: float = 0.0
-    max_calls:    int   = 500
-    calls_made:   int   = 0
-
-    def can_proceed(self, model: ModelInterface) -> bool:
-        if self.calls_made >= self.max_calls:
-            return False
-        return self.current_cost + self._estimate_call_cost(model) <= self.max_cost_usd
-
-    def record_call(
-        self,
-        model:      ModelInterface,
-        tokens_in:  int = 1000,
-        tokens_out: int = 500,
-    ) -> None:
-        cost_in  = model.cost_per_1k_input_tokens  or 0.0
-        cost_out = model.cost_per_1k_output_tokens or 0.0
-        self.current_cost += (tokens_in / 1000) * cost_in + (tokens_out / 1000) * cost_out
-        self.calls_made   += 1
-
-    def _estimate_call_cost(self, model: ModelInterface) -> float:
-        cost_in  = model.cost_per_1k_input_tokens  or 0.0
-        cost_out = model.cost_per_1k_output_tokens or 0.0
-        return (2.0 * cost_in) + (1.0 * cost_out)
-
-    @property
-    def remaining_budget(self) -> float:
-        return self.max_cost_usd - self.current_cost
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "max_cost_usd":      self.max_cost_usd,
-            "current_cost":      self.current_cost,
-            "calls_made":        self.calls_made,
-            "remaining_budget":  self.remaining_budget,
-        }
-
-
-# ---------------------------------------------------------------------------
-# GBNF grammar — tested against llama.cpp grammar validator
-# ---------------------------------------------------------------------------
-_OUTPUT_GRAMMAR = r'''
-root ::= "{" ws kv-thought "," ws kv-action "," ws kv-input "," ws kv-conf ws "}"
-kv-thought ::= "\"thought\"" ws ":" ws string
-kv-action ::= "\"action\"" ws ":" ws string
-kv-input ::= "\"action_input\"" ws ":" ws object
-kv-conf ::= "\"confidence\"" ws ":" ws number
-value ::= string | number | object | array | "true" | "false" | "null"
-object ::= "{" ws ( string ws ":" ws value ( "," ws string ws ":" ws value )* )? ws "}"
-array ::= "[" ws ( value ( "," ws value )* )? ws "]"
-string ::= "\"" ( [^"\\] | "\\" . )* "\""
-number ::= "-"? ( "0" | [1-9] [0-9]* ) ( "." [0-9]+ )? ( [eE] [+-]? [0-9]+ )?
-ws ::= [ \t\n\r]*
-'''
-
-_VALID_ACTIONS = frozenset([
-    "codeql_query",
-    "gdb_analyze",
-    "fuzzer_run",
-    "git_blame",
-    "injection_verifier",
-    "read_file",
-    "rag_search",
-    "FINISH",
-    "NO_ACTION",
-])
-
-# Tools whose output can confirm a real vulnerability (source check for FIX 7)
-_VULN_CONFIRMING_TOOLS = frozenset(["gdb_analyze", "fuzzer_run", "codeql_query", "injection_verifier"])
-
-_ESCALATION_COOLDOWN    = 5
-_MAX_HISTORY_STEPS      = 12
-_TOOL_TIMEOUT_SECONDS   = 30.0
-
-# Data-driven payload table for strict-mode auto-verification.
-# Maps AST finding rule → injection payload.  None = static-only (no verifier call).
-_PAYLOAD_MAP: dict[str, str | None] = {
-    "GIT_OPTION_INJECTION":        "--upload-pack=test",
-    "SUBPROCESS_SHELL_TRUE":       "$(id)",
-    "UNSANITIZED_SUBPROCESS_ARG":  "../../etc/passwd",
-    "OPEN_USER_PATH":              "../../etc/passwd",
-    "SUBPROCESS_EXEC_STARRED":     "../../etc/passwd",
-    "HARDCODED_SECRET":            None,   # static-only, nothing to inject
-}
-
-# Maps Python variable names (from AST) → likely action_input keys.
-# Needed because tool internals use `action_input.get("file")` but the
-# local variable inside the tool is often named `file_path`.
-_VARNAME_TO_FIELD: dict[str, str] = {
-    "file_path": "file",
-    "filepath":  "file",
-    "path":      "path",
-    "author":    "author",
-    "grep":      "grep",
-    "since":     "since",
-    "until":     "until",
-}
 
 
 class KeryxAgent:
@@ -182,14 +103,17 @@ class KeryxAgent:
         self._steps_since_escalation:       int = _ESCALATION_COOLDOWN
         self._consecutive_failures:         int = 0
         self._max_consecutive_failures:     int = 3
-        self._steps_since_new_hypothesis:   int = 0   # P4: stagnation tracker
-        self._consecutive_low_confidence:   int = 0   # P4: low-conf streak
-        self._codeql_unconfirmed:           bool = False  # P4: AST found HIGH but not confirmed
-        self._codeql_high_observation:     str  = ""    # observation snapshot from the triggering codeql step
+        self._steps_since_new_hypothesis:   int = 0   # stagnation tracker
+        self._consecutive_low_confidence:   int = 0   # low-conf streak
+        self._codeql_unconfirmed:           bool = False  # AST found HIGH but not confirmed
+        self._codeql_high_observation:      str  = ""     # observation snapshot from triggering step
         # Early-exit: break after this many consecutive clean codeql scans (no HIGH findings).
         # 1 = exit on first clean scan (fast mode); set higher to let agent probe more paths.
         self._consecutive_clean_scans:      int  = 0
         self._max_clean_scans_before_exit:  int  = max_clean_scans_before_exit
+        # One-shot hint from a previous model pass (Phase 1c escalation).
+        # Injected into the first prompt only; cleared after that step.
+        self._initial_hint: str | None = None
 
     # ------------------------------------------------------------------
     # Context property
@@ -218,16 +142,21 @@ class KeryxAgent:
 
     async def run(
         self,
-        target_path: str,
-        capability:  str  = "deep_reasoning",
-        resume:      bool = True,
-        context: SharedContext | None = None,
+        target_path:  str,
+        capability:   str              = "deep_reasoning",
+        resume:       bool             = True,
+        context:      SharedContext | None = None,
+        context_hint: str | None       = None,
     ) -> dict[str, Any]:
         """Main hunt loop.
 
-        context: pre-built SharedContext injected by KeryxOrchestrator so that
-                 accumulated state (steps, hypotheses, escalation level) is preserved
-                 across escalation attempts.  When provided, resume is ignored.
+        context:      pre-built SharedContext injected by KeryxOrchestrator so that
+                      accumulated state (steps, hypotheses, escalation level) is
+                      preserved across escalation attempts.  When provided, resume
+                      is ignored.
+        context_hint: optional one-line note from a previous model pass, prepended
+                      to the FIRST step prompt only (Phase 1c escalation hint).
+                      Cleared after the first generate call so it does not repeat.
         """
         if context is not None:
             self._shared_context = context
@@ -235,6 +164,11 @@ class KeryxAgent:
             self._shared_context = self._load_checkpoint(target_path) if resume else None
         if self._shared_context is None:
             self._shared_context = SharedContext(target_path=target_path, capability=capability)
+
+        if context_hint:
+            self._initial_hint = context_hint
+            print(f"[Agent] Received hint from previous model: {context_hint[:200]}"
+                  f"{'...' if len(context_hint) > 200 else ''}")
 
         print(
             f"[Agent] Hunt starting | target={target_path} | capability={capability} "
@@ -266,10 +200,8 @@ class KeryxAgent:
 
             # ── Pre-step guard (budget + health) ─────────────────────────
             precond = await self._precondition_check()
-            if precond == "break":
-                break
-            if precond == "continue":
-                continue
+            if precond == "break":    break
+            if precond == "continue": continue
 
             step = self.context.steps_taken + 1
             print(f"[Step {step}/{self.max_steps}]")
@@ -281,13 +213,13 @@ class KeryxAgent:
             else:
                 prompt = self._build_prompt()
 
-            # FIX 5: trim_history() now exists — uncommented
             if len(prompt) > self.max_prompt_chars:
                 self.context.trim_history()
                 prompt = self._build_prompt()
 
             # ── Generate ─────────────────────────────────────────────────
             action = await self._safe_generate(prompt)
+            self._initial_hint = None   # one-shot: clear after first generate
             self._steps_since_escalation += 1
 
             if self.budget and action:
@@ -309,72 +241,15 @@ class KeryxAgent:
                 self._consecutive_failures = 0
 
             # ── Validate action name ──────────────────────────────────────
-            if action.action not in _VALID_ACTIONS:
+            if action.action not in VALID_ACTIONS:
                 print(f"[WARN] Unknown action '{action.action}' — treating as NO_ACTION")
                 action.action = "NO_ACTION"
 
-            # ── Execute tool ──────────────────────────────────────────────
-            _prev_hyp_count = len(self.context.hypotheses)   # P4: stagnation baseline
-            # Extract hypothesis before tool execution so it is always defined,
-            # even if the tool raises (it is referenced in stop checks below).
-            hyp = action.action_input.get("hypothesis", "")
-            if action.action not in ("NO_ACTION", "FINISH"):
-                try:
-                    observation = await asyncio.wait_for(
-                        self._execute_tool_async(action.action, action.action_input),
-                        timeout=_TOOL_TIMEOUT_SECONDS,
-                    )
-                    action.observation = observation
-                    self.context.add_step(action, observation)
-                    print(f"[Tool] {action.action} completed in {time.time() - action.timestamp:.2f}s")
+            # ── Execute tool + critique + per-step bookkeeping ────────────
+            hyp    = action.action_input.get("hypothesis", "")
+            action = await self._execute_and_critique(action)
 
-                    if hyp:
-                        self.context.add_hypothesis(hyp)
-                        # Record non-trivial observations as evidence
-                        if len(observation) > 50:
-                            loc = action.action_input.get("path") or action.action_input.get("file") or action.action
-                            self.context.add_evidence(location=str(loc), description=hyp[:200])
-
-                    critique = await self._self_critique_async(hypothesis=hyp, observation=observation)
-                    self._apply_critique(critique, action)
-
-                except TimeoutError:
-                    msg = f"Tool '{action.action}' timed out after {_TOOL_TIMEOUT_SECONDS}s"
-                    print(f"[ERROR] {msg}")
-                    action.observation = msg
-                    action.confidence  *= 0.5
-                    self.context.add_step(action, msg)
-
-                except Exception as exc:
-                    msg = f"Tool '{action.action}' failed: {exc}"
-                    print(f"[ERROR] {msg}")
-                    action.observation = msg
-                    action.confidence  *= 0.7
-                    self.context.add_step(action, msg)
-            else:
-                self.context.add_step(action, "No action taken")
-
-            # ── P4: update advisor-trigger state ─────────────────────────
-            # Stagnation: reset counter if any new hypothesis was added this step
-            if len(self.context.hypotheses) > _prev_hyp_count:
-                self._steps_since_new_hypothesis = 0
-            else:
-                self._steps_since_new_hypothesis += 1
-
-            # Confidence streak: reset on any step with confidence >= 0.3
-            if action.confidence >= 0.3:
-                self._consecutive_low_confidence = 0
-            else:
-                self._consecutive_low_confidence += 1
-
-            # Unconfirmed codeql HIGH: flag so advisor triggers on next chance
-            if (
-                action.action == "codeql_query"
-                and self._observation_confirms_vuln(action.observation)
-            ):
-                self._codeql_unconfirmed = True
-
-            # Early exit: clean codeql scan (no HIGH findings).
+            # ── Early exit: clean codeql scan ─────────────────────────────
             if self._should_exit_clean(action):
                 break
 
@@ -386,14 +261,10 @@ class KeryxAgent:
             await self._maybe_escalate()
 
             # ── Vuln confirmation stop conditions ─────────────────────────
-            # (three-mode dispatch, static fallback, dynamic confirm, FINISH)
             if await self._should_stop_on_confirmation(action, step, hyp):
                 break
 
             # ── Checkpoint every 5 steps ──────────────────────────────────
-            # Saves after the step completes (steps_taken already incremented).
-            # On resume, the agent continues from this step count.
-            # Checkpoint format: JSON only — no pickle, no arbitrary execution.
             if step % 5 == 0:
                 self._save_checkpoint(target_path)
 
@@ -426,7 +297,6 @@ class KeryxAgent:
                 )
             except TimeoutError:
                 print(f"[WARN] Generation timeout (attempt {attempt + 1})")
-                # FIX 4: count generation timeouts as parse errors
                 self.context.increment_parse_errors()
                 if attempt == 1:
                     return None
@@ -442,7 +312,7 @@ class KeryxAgent:
         return await loop.run_in_executor(
             None,
             lambda: self.executor.generate(
-                prompt, grammar=_OUTPUT_GRAMMAR, max_tokens=max_tokens
+                prompt, grammar=OUTPUT_GRAMMAR, max_tokens=max_tokens
             ),
         )
 
@@ -488,7 +358,6 @@ class KeryxAgent:
 
         # injection_verifier REJECTED ≠ code is safe.
         # The static AST finding stands; dynamic test only adds confidence, never removes it.
-        # Only allow confidence boost here — blacklisting is not appropriate.
         if action.action == "injection_verifier":
             if "VULN_CONFIRMED" in action.observation:
                 action.confidence = min(action.confidence + 0.2, 0.95)
@@ -521,12 +390,81 @@ class KeryxAgent:
         self.context.add_critique(critique)
 
     # ------------------------------------------------------------------
+    # Step execution — tool call + critique + per-step bookkeeping
+    # ------------------------------------------------------------------
+
+    async def _execute_and_critique(self, action: AgentStep) -> AgentStep:
+        """Run the tool, record hypothesis + evidence, run self-critique,
+        update stagnation/confidence trackers.  Returns the filled AgentStep.
+
+        All per-step side effects are scoped here so run() stays a clean loop.
+        """
+        prev_hyp_count = len(self.context.hypotheses)
+        hyp = action.action_input.get("hypothesis", "")
+
+        if action.action not in ("NO_ACTION", "FINISH"):
+            try:
+                obs = await asyncio.wait_for(
+                    self._execute_tool_async(action.action, action.action_input),
+                    timeout=_TOOL_TIMEOUT_SECONDS,
+                )
+                action.observation = obs
+                self.context.add_step(action, obs)
+                print(f"[Tool] {action.action} completed in {time.time() - action.timestamp:.2f}s")
+
+                if hyp:
+                    self.context.add_hypothesis(hyp)
+                    if len(obs) > 50:
+                        loc = (
+                            action.action_input.get("path")
+                            or action.action_input.get("file")
+                            or action.action
+                        )
+                        self.context.add_evidence(location=str(loc), description=hyp[:200])
+
+                critique = await self._self_critique_async(hypothesis=hyp, observation=obs)
+                self._apply_critique(critique, action)
+
+            except TimeoutError:
+                msg = f"Tool '{action.action}' timed out after {_TOOL_TIMEOUT_SECONDS}s"
+                print(f"[ERROR] {msg}")
+                action.observation = msg
+                action.confidence  *= 0.5
+                self.context.add_step(action, msg)
+
+            except Exception as exc:
+                msg = f"Tool '{action.action}' failed: {exc}"
+                print(f"[ERROR] {msg}")
+                action.observation = msg
+                action.confidence  *= 0.7
+                self.context.add_step(action, msg)
+        else:
+            self.context.add_step(action, "No action taken")
+
+        # Stagnation tracker: reset when a new hypothesis was added this step
+        if len(self.context.hypotheses) > prev_hyp_count:
+            self._steps_since_new_hypothesis = 0
+        else:
+            self._steps_since_new_hypothesis += 1
+
+        # Confidence streak tracker
+        if action.confidence >= 0.3:
+            self._consecutive_low_confidence = 0
+        else:
+            self._consecutive_low_confidence += 1
+
+        # Flag unconfirmed codeql HIGH so advisor triggers on next chance
+        if action.action == "codeql_query" and observation_confirms_vuln(action.observation):
+            self._codeql_unconfirmed = True
+
+        return action
+
+    # ------------------------------------------------------------------
     # Loop control helpers — each stop condition in one testable place
     # ------------------------------------------------------------------
 
     async def _precondition_check(self) -> Literal["proceed", "break", "continue"]:
-        """
-        Pre-step gate: budget and model health.
+        """Pre-step gate: budget and model health.
 
         Returns:
             "proceed"  — all clear, run the step
@@ -548,51 +486,57 @@ class KeryxAgent:
         return "proceed"
 
     def _should_exit_clean(self, action: AgentStep) -> bool:
-        """
-        Returns True if the loop should stop due to a clean codeql scan.
+        """Returns True if the loop should stop due to a clean codeql scan.
 
-        A clean scan (no HIGH findings) increments the counter.
-        Any HIGH finding resets it.  When the threshold is reached, early exit.
+        Delegates to the pure check_exit_clean() and updates the counter.
         Called BEFORE advisor advice so we don't waste an LLM call on a clean file.
         """
-        if action.action != "codeql_query":
-            return False
-        if self._observation_confirms_vuln(action.observation):
-            self._consecutive_clean_scans = 0   # HIGH found — reset counter
-            return False
-        self._consecutive_clean_scans += 1
-        if self._consecutive_clean_scans >= self._max_clean_scans_before_exit:
+        should_exit, self._consecutive_clean_scans = check_exit_clean(
+            action, self._consecutive_clean_scans, self._max_clean_scans_before_exit
+        )
+        if should_exit:
             print(
                 f"[Agent] codeql returned no findings "
                 f"({self._consecutive_clean_scans}x clean) — early exit."
             )
-            return True
-        return False
+        return should_exit
+
+    @staticmethod
+    def _extract_rules(observation: str) -> list[str]:
+        """Return deduplicated rule names found in an AST/codeql observation.
+
+        Parses patterns like ``[HIGH] SUBPROCESS_SHELL_TRUE @ line 5`` and
+        ``[MEDIUM] LLM_OUTPUT_SINK @ line 12``.  Order is preserved (first
+        occurrence wins), duplicates removed.
+        """
+        seen: dict[str, None] = {}
+        for m in re.finditer(r"\[(?:HIGH|MEDIUM|LOW)\]\s+(\w+)", observation):
+            seen.setdefault(m.group(1), None)
+        return list(seen)
 
     async def _should_stop_on_confirmation(
         self, action: AgentStep, step: int, hyp: str
     ) -> bool:
-        """
-        Post-advisor termination gate: vuln confirmed, static fallback, FINISH.
+        """Post-advisor termination gate: vuln confirmed, static fallback, FINISH.
 
         Returns True if the loop should stop.
         Side effects: appends to context.confirmed_vulns, resets verification fields.
         """
         ast_found = (
             action.action == "codeql_query"
-            and self._observation_confirms_vuln(action.observation)
+            and observation_confirms_vuln(action.observation)
         )
         # injection_verifier uses a lower confidence bar — VULN_CONFIRMED in output
         # is already an objective signal, no need for model confidence >= 0.85.
         dynamic_confirmed = (
             (
                 action.confidence >= 0.85
-                and action.action in _VULN_CONFIRMING_TOOLS - {"codeql_query", "injection_verifier"}
-                and self._observation_confirms_vuln(action.observation)
+                and action.action in VULN_CONFIRMING_TOOLS - {"codeql_query", "injection_verifier"}
+                and observation_confirms_vuln(action.observation)
             )
             or (
                 action.action == "injection_verifier"
-                and self._observation_confirms_vuln(action.observation)
+                and observation_confirms_vuln(action.observation)
             )
         )
 
@@ -604,6 +548,7 @@ class KeryxAgent:
                 # Immediate static confirm — no verifier, no window.
                 self._codeql_unconfirmed = False
                 print("[Agent] none mode — static confirm (AST-only).")
+                _rules = self._extract_rules(action.observation)
                 self.context.confirmed_vulns.append({
                     "step":           step,
                     "action":         action.action,
@@ -612,15 +557,19 @@ class KeryxAgent:
                     "hypothesis":     hyp,
                     "verified":       False,
                     "confidence_tag": "AST-only",
+                    "rules":          _rules,
+                    "rule":           _rules[0] if _rules else "UNKNOWN",
                 })
                 return True
 
             elif mode == "strict":
-                # Auto-verify via injection_verifier — no extra LLM step.
-                iv_ok = await self._auto_verify_injection(action.observation)
-                tag = "AST+injection_verifier" if iv_ok else "AST-only"
+                # Auto-verify — injection_verifier for internal targets,
+                # fuzzer PoC for external targets (target_tool not in toolbox).
+                iv_ok, verify_method = await self._auto_verify_injection(action.observation)
+                tag = f"AST+{verify_method}" if iv_ok else "AST-only"
                 self._codeql_unconfirmed = False
                 print(f"[Agent] strict mode — confirmed ({tag}).")
+                _rules = self._extract_rules(action.observation)
                 self.context.confirmed_vulns.append({
                     "step":           step,
                     "action":         action.action,
@@ -629,6 +578,8 @@ class KeryxAgent:
                     "hypothesis":     hyp,
                     "verified":       iv_ok,
                     "confidence_tag": tag,
+                    "rules":          _rules,
+                    "rule":           _rules[0] if _rules else "UNKNOWN",
                 })
                 return True
 
@@ -651,6 +602,7 @@ class KeryxAgent:
         ):
             print("[Agent] Verification window elapsed — confirming (AST-only).")
             self._codeql_unconfirmed = False
+            _rules = self._extract_rules(self._codeql_high_observation)
             self.context.confirmed_vulns.append({
                 "step":           self._codeql_high_found_step,
                 "action":         "codeql_query",
@@ -659,6 +611,8 @@ class KeryxAgent:
                 "hypothesis":     hyp,
                 "verified":       False,
                 "confidence_tag": "AST-only",
+                "rules":          _rules,
+                "rule":           _rules[0] if _rules else "UNKNOWN",
             })
             return True
 
@@ -668,6 +622,7 @@ class KeryxAgent:
             self._codeql_high_found_step = -100
             self._codeql_high_observation = ""
             print("[Agent] Dynamically confirmed via injection_verifier — stopping early.")
+            _rules = self._extract_rules(action.observation)
             self.context.confirmed_vulns.append({
                 "step":           step,
                 "action":         action.action,
@@ -676,6 +631,8 @@ class KeryxAgent:
                 "hypothesis":     hyp,
                 "verified":       True,
                 "confidence_tag": "AST+injection_verifier",
+                "rules":          _rules,
+                "rule":           _rules[0] if _rules else "UNKNOWN",
             })
             return True
 
@@ -693,24 +650,20 @@ class KeryxAgent:
         direction = advice.strategic_direction or advice.strategy
         print(f"[Advisor] Applying advice: {direction[:120]}")
 
-        # Strategic direction → injected into next prompt
         if direction:
             self.context.set_advisor_guidance(direction)
 
-        # Confidence threshold adjustment
         if advice.adjust_confidence_threshold is not None:
             self.confidence_threshold = max(
                 0.3, min(0.9, advice.adjust_confidence_threshold)
             )
             print(f"[Advisor] Confidence threshold → {self.confidence_threshold:.2f}")
 
-        # Suggested hypotheses (from AdvisorResponse rich fields, stored in raw)
         for hyp in advice.raw.get("suggested_hypotheses", []):
             if hyp:
                 self.context.add_hypothesis(hyp)
                 print(f"[Advisor] Suggested hypothesis: {hyp[:80]}")
 
-        # Advisor-driven blacklist
         for hyp in advice.raw.get("blacklist_hypotheses", []):
             if hyp:
                 self.context.blacklist_hypothesis(hyp)
@@ -719,225 +672,41 @@ class KeryxAgent:
         self.context.clear_pending_advisor_advice()
 
     # ------------------------------------------------------------------
-    # Auto-verification (strict mode — no LLM call, pure tool pipeline)
+    # Auto-verification — thin wrappers; logic lives in VerificationPipeline
     # ------------------------------------------------------------------
 
     def _resolve_target_tool(self) -> str | None:
-        """
-        Infer which registered tool corresponds to the file being analyzed.
-
-        Strategy B+A:
-        1. (A) Exact stem match: git_blame.py → "git_blame" — check in toolbox.
-        2. (A normalized) Underscore/hyphen variants.
-        3. (B) Partial match: any registered tool name contained in the stem.
-        4. Warn and return None if nothing found.
-        """
-        available = set(self.tools.list_tools())
-        stem = Path(self.context.target_path).stem          # "git_blame"
-
-        # A — exact
-        if stem in available:
-            return stem
-        # A — normalized (hyphens → underscores)
-        normalized = stem.replace("-", "_").replace(" ", "_")
-        if normalized in available:
-            return normalized
-        # B — partial: "git_blame_wrapper" contains "git_blame"
-        for tool in available:
-            if tool in stem or stem in tool:
-                return tool
-
-        print(
-            f"[WARN] target_tool not resolved for {stem!r} — "
-            "skipping dynamic verification"
-        )
-        return None
+        return VerificationPipeline(self.tools, self.context).resolve_target_tool()
 
     @staticmethod
     def _extract_findings_for_verification(
         codeql_observation: str,
     ) -> list[tuple[str, str, str]]:
-        """
-        Parse HIGH findings from codeql output.
+        return VerificationPipeline.extract_findings(codeql_observation)
 
-        Returns list of (rule, inject_field, payload) tuples ready for
-        injection_verifier.  Skips rules with no payload (e.g. HARDCODED_SECRET).
-        """
-        import re
-
-        # Match lines like: [HIGH] RULE_NAME @ line N: <context snippet>
-        high_lines = re.findall(
-            r'\[HIGH\] (\w+) @.*?:\s*(.+?)(?:\n|$)', codeql_observation
-        )
-
-        results: list[tuple[str, str, str]] = []
-        seen_rules: set[str] = set()
-
-        for rule, context_text in high_lines:
-            if rule in seen_rules:
-                continue          # one attempt per rule is enough
-            payload = _PAYLOAD_MAP.get(rule)
-            if payload is None:
-                continue          # HARDCODED_SECRET etc. — static-only
-
-            # Extract the injectable field name from the context snippet
-            inject_field: str | None = None
-
-            if rule == "GIT_OPTION_INJECTION":
-                m = re.search(r'cmd\.extend\(\["--[\w-]+",\s*(\w+)\]', context_text)
-                if m:
-                    inject_field = _VARNAME_TO_FIELD.get(m.group(1), m.group(1))
-
-            elif rule in ("UNSANITIZED_SUBPROCESS_ARG", "SUBPROCESS_EXEC_STARRED"):
-                m = re.search(r'cmd\.(?:append|exec)\((\w+)\)', context_text)
-                if m:
-                    inject_field = _VARNAME_TO_FIELD.get(m.group(1), m.group(1))
-
-            elif rule == "OPEN_USER_PATH":
-                m = re.search(r'open\((\w+)\)', context_text)
-                if m:
-                    inject_field = _VARNAME_TO_FIELD.get(m.group(1), m.group(1))
-
-            elif rule == "SUBPROCESS_SHELL_TRUE":
-                inject_field = "file"   # best-effort for shell=True calls
-
-            if inject_field:
-                results.append((rule, inject_field, payload))
-                seen_rules.add(rule)
-
-        return results
-
-    async def _auto_verify_injection(self, codeql_observation: str) -> bool:
-        """
-        Strict-mode auto-verification: resolve target tool, extract HIGH
-        findings, probe each via injection_verifier — zero extra LLM tokens.
-
-        Returns True if ANY finding is dynamically confirmed (VULN_CONFIRMED).
-        """
-        target_tool = self._resolve_target_tool()
-        if target_tool is None:
-            return False
-
-        findings = self._extract_findings_for_verification(codeql_observation)
-        if not findings:
-            print("[AutoVerify] No verifiable HIGH findings — static-only confirmation.")
-            return False
-
-        for rule, inject_field, payload in findings:
-            print(
-                f"[AutoVerify] {target_tool!r} | rule={rule} | "
-                f"field={inject_field!r} | payload={payload!r}"
-            )
-            try:
-                result = await asyncio.wait_for(
-                    self.tools.execute_async(
-                        "injection_verifier",
-                        {
-                            "target_tool":       target_tool,
-                            "inject_field":      inject_field,
-                            "payload":           payload,
-                            "expected_behavior": "reject",
-                            "base_overrides":    {"file": self.context.target_path},
-                        },
-                    ),
-                    timeout=20.0,
-                )
-            except Exception as exc:
-                print(f"[AutoVerify] Verifier call failed ({rule}): {exc}")
-                continue
-
-            observation = result.output if hasattr(result, "output") else str(result)
-            self.context.add_step(
-                AgentStep(
-                    thought=f"auto_verify_{rule}",
-                    action="injection_verifier",
-                    action_input={
-                        "target_tool": target_tool,
-                        "inject_field": inject_field,
-                        "payload": payload,
-                    },
-                    confidence=0.9 if "VULN_CONFIRMED" in observation else 0.35,
-                ),
-                observation,
-            )
-            self.context.add_evidence(
-                location=f"injection_verifier:{target_tool}.{inject_field}",
-                description=f"strict-mode auto-verification of {rule}",
-            )
-
-            if "VULN_CONFIRMED" in observation:
-                print(f"[AutoVerify] CONFIRMED — {target_tool}.{inject_field}")
-                return True
-            print(f"[AutoVerify] REJECTED — {target_tool}.{inject_field}")
-
-        return False
+    async def _auto_verify_injection(self, codeql_observation: str) -> tuple[bool, str]:
+        """Return (confirmed, method_tag) from VerificationPipeline.auto_verify()."""
+        return await VerificationPipeline(self.tools, self.context).auto_verify(codeql_observation)
 
     # ------------------------------------------------------------------
     # Parsing
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Parsing — thin wrappers; pure logic lives in _parser.py
+    # ------------------------------------------------------------------
+
     def _extract_json(self, raw: str) -> str | None:
-        import re
-        # Strip HTML-like injection attempts (e.g. <script>, </tool_call>) and
-        # C0/C1 control characters that can smuggle payloads past JSON parsers.
-        raw = re.sub(r'<[^>]{0,200}>', '', raw)
-        raw = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', raw)
-        raw = raw.strip()
-        if raw.startswith("```"):
-            parts = raw.split("```")
-            if len(parts) >= 2:
-                raw = parts[1]
-                if raw.startswith("json"):
-                    raw = raw[4:].strip()
-        start = raw.find("{")
-        end   = raw.rfind("}")
-        if start != -1 and end != -1 and start < end:
-            return raw[start:end + 1]
-        return None
+        return extract_json(raw)
 
     def _fallback_parse(self, raw: str) -> AgentStep:
-        raw_lower = raw.lower()
-        for action in _VALID_ACTIONS:
-            if action.lower() in raw_lower and action != "NO_ACTION":
-                return AgentStep(
-                    thought="fallback_parse_inferred",
-                    action=action,
-                    action_input={},
-                    confidence=0.3,
-                )
-        return AgentStep(
-            thought="fallback_parse_failed",
-            action="NO_ACTION",
-            action_input={},
-            confidence=0.1,
-        )
+        return fallback_parse(raw)
 
     def _parse_response(self, raw: str) -> AgentStep:
-        json_str = self._extract_json(raw)
-        if not json_str:
-            print(f"[WARN] Could not extract JSON from response (len={len(raw)})")
-            # FIX 4: increment so _should_escalate() escalation-by-errors fires
+        step, had_error = parse_response(raw)
+        if had_error:
             self.context.increment_parse_errors()
-            return self._fallback_parse(raw)
-
-        try:
-            data = json.loads(json_str)
-            if not isinstance(data, dict) or "action" not in data:
-                # Structurally invalid — missing required key means the model
-                # produced something that looks like JSON but isn't our schema.
-                print("[WARN] JSON missing required 'action' key — treating as parse error")
-                self.context.increment_parse_errors()
-                return self._fallback_parse(raw)
-            return AgentStep(
-                thought=      str(data.get("thought", "")),
-                action=       str(data.get("action", "NO_ACTION")),
-                action_input= dict(data.get("action_input", {})),
-                confidence=   float(data.get("confidence", 0.5)),
-            )
-        except Exception as exc:
-            print(f"[WARN] JSON parse failed: {exc.__class__.__name__}: {exc}")
-            self.context.increment_parse_errors()
-            return self._fallback_parse(raw)
+        return step
 
     # ------------------------------------------------------------------
     # Prompt building
@@ -968,10 +737,8 @@ class KeryxAgent:
 
     def _build_prompt(self) -> str:
         ctx    = self.context
-        recent = ctx.get_recent_history(_MAX_HISTORY_STEPS)
+        recent = ctx.get_recent_history(MAX_HISTORY_STEPS)
 
-        # FIX 5: budget line built separately — ternary mid-concatenation
-        # causes the remaining string literals to be silently dropped.
         budget_line = (
             f"Budget used : ${self.budget.current_cost:.4f} / ${self.budget.max_cost_usd:.2f}\n"
             if self.budget else ""
@@ -983,8 +750,13 @@ class KeryxAgent:
         except Exception:
             target_lines = "unknown"
 
+        hint_block = (
+            f"[HINT FROM PREVIOUS MODEL]\n{self._initial_hint}\n\n"
+            if self._initial_hint else ""
+        )
         return (
             "You are Keryx Executor — a precise vulnerability hunter analyzing Python code.\n"
+            f"{hint_block}"
             f"Target file  : {ctx.target_path}  ({target_lines} lines total)\n"
             f"Hypotheses   : {len(ctx.hypotheses)}\n"
             f"Confirmed    : {len(ctx.confirmed_vulns)}\n"
@@ -993,7 +765,7 @@ class KeryxAgent:
             f"{recent}\n\n"
             "Known hypotheses (do NOT repeat these):\n"
             f"{ctx.get_deduplicated_hypotheses()}\n\n"
-            "Available actions: " + ", ".join(sorted(_VALID_ACTIONS)) + "\n\n"
+            "Available actions: " + ", ".join(sorted(VALID_ACTIONS)) + "\n\n"
             "Output ONLY a JSON object in this exact format:\n"
             '{"thought": "your reasoning", "action": "read_file", '
             '"action_input": {"path": "/full/path", "start_line": 1, "end_line": 100, '
@@ -1026,12 +798,6 @@ class KeryxAgent:
         )
 
     def _build_prompt_with_guidance(self) -> str:
-        """
-        FIX 2: use get_advisor_guidance() — returns a clean string set by
-        _apply_advisor_advice() via set_advisor_guidance().
-        Previously called get_pending_advisor_advice() which returns an
-        AdvisorAdvice dataclass repr, not useful for the LLM.
-        """
         base     = self._build_prompt()
         guidance = self.context.get_advisor_guidance()
         if guidance:
@@ -1069,17 +835,9 @@ class KeryxAgent:
         if self._steps_since_escalation < _ESCALATION_COOLDOWN:
             return False
 
-        # P4: four specific trigger conditions (fire on ANY one)
-        # 1. Stagnation — no new hypothesis added in the last 5 steps
-        stagnation = self._steps_since_new_hypothesis >= 5
-
-        # 2. Confidence streak — confidence < 0.3 for 3 consecutive steps
+        stagnation      = self._steps_since_new_hypothesis >= 5
         low_conf_streak = self._consecutive_low_confidence >= 3
-
-        # 3. Escalation level already elevated by the orchestrator
-        level_elevated = self.context.escalation_level >= 2
-
-        # 4. AST analyzer found HIGH findings but none have been confirmed yet
+        level_elevated  = self.context.escalation_level >= 2
         unconfirmed_codeql = self._codeql_unconfirmed
 
         return stagnation or low_conf_streak or level_elevated or unconfirmed_codeql
@@ -1093,7 +851,7 @@ class KeryxAgent:
         return self.checkpoint_dir / f"checkpoint_{key}.json"
 
     def _save_checkpoint(self, target_path: str) -> None:
-        """FIX 6: JSON serialisation via SharedContext.to_dict() — no pickle."""
+        """JSON serialisation via SharedContext.to_dict() — no pickle."""
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         path = self._checkpoint_path(target_path)
         try:
@@ -1107,7 +865,7 @@ class KeryxAgent:
             print(f"[WARN] Checkpoint save failed: {exc}")
 
     def _load_checkpoint(self, target_path: str) -> SharedContext | None:
-        """FIX 6: load from JSON — no arbitrary code execution."""
+        """Load from JSON — no arbitrary code execution."""
         path = self._checkpoint_path(target_path)
         if not path.exists():
             return None
@@ -1133,45 +891,29 @@ class KeryxAgent:
 
     @staticmethod
     def _observation_confirms_vuln(observation: str) -> bool:
+        """Delegates to the module-level pure function in _loop_guards.
+        Kept for backward-compatibility with existing callers and tests.
         """
-        FIX 7: called only when action.action in _VULN_CONFIRMING_TOOLS,
-        so source-check is enforced at the call site, not here.
-        Signals that constitute a real crash/sanitizer finding.
-        """
-        signals = (
-            "VULN_CONFIRMED",
-            "AddressSanitizer",
-            "heap-use-after-free",
-            "stack-buffer-overflow",
-            "SEGFAULT",
-            "CRASH",
-            "UAF",
-            # AST analyzer signals
-            "[HIGH]",
-            "GIT_OPTION_INJECTION",
-            "SUBPROCESS_SHELL_TRUE",
-            "HARDCODED_SECRET",
-        )
-        return any(s in observation for s in signals)
+        return observation_confirms_vuln(observation)
 
     def _generate_final_report(self) -> dict[str, Any]:
         from dataclasses import asdict
         clusters = self.context.cluster_hypotheses()
         return {
-            "status":            "completed",
-            "target":            self.context.target_path,
-            "steps_taken":       self.context.steps_taken,
-            "max_steps":         self.max_steps,
-            "confirmed_vulns":   self.context.confirmed_vulns,
-            "hypotheses":        list(self.context.hypotheses),
-            "hypotheses_count":  len(self.context.hypotheses),
+            "status":              "completed",
+            "target":              self.context.target_path,
+            "steps_taken":         self.context.steps_taken,
+            "max_steps":           self.max_steps,
+            "confirmed_vulns":     self.context.confirmed_vulns,
+            "hypotheses":          list(self.context.hypotheses),
+            "hypotheses_count":    len(self.context.hypotheses),
             "hypothesis_clusters": clusters,
-            "blacklisted":       list(self.context.blacklist),
-            "evidence":          [asdict(e) for e in self.context.evidence],
-            "critiques":         list(self.context._critiques),
-            "advisor_calls":     self.advisor_manager.calls_made,
-            "parse_errors":      self.context.parse_errors,
-            "budget":            self.budget.to_dict() if self.budget else None,
+            "blacklisted":         list(self.context.blacklist),
+            "evidence":            [asdict(e) for e in self.context.evidence],
+            "critiques":           list(self.context._critiques),
+            "advisor_calls":       self.advisor_manager.calls_made,
+            "parse_errors":        self.context.parse_errors,
+            "budget":              self.budget.to_dict() if self.budget else None,
             "model": {
                 "name":     self.executor.model_name,
                 "is_local": self.executor.is_local,

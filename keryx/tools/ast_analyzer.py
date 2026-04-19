@@ -35,6 +35,15 @@ class Finding:
     col:         int
     message:     str
     snippet:     str = ""
+    source_type: str = "unknown"
+    # source_type values:
+    #   "param"      — vulnerable arg is a direct function parameter (highest risk:
+    #                  caller controls it with no intermediate transformation)
+    #   "local"      — a local variable (possibly already validated upstream)
+    #   "expression" — a complex expression (f-string, BinOp, subscript, call);
+    #                  tainted if any sub-Name is a param
+    #   "constant"   — hardcoded literal (should not reach here; used as guard)
+    #   "unknown"    — could not determine (e.g. no enclosing function found)
 
     def __str__(self) -> str:
         loc = f"line {self.line}"
@@ -51,6 +60,9 @@ class _VulnVisitor(ast.NodeVisitor):
     def __init__(self, source_lines: list[str]) -> None:
         self.findings: list[Finding] = []
         self._lines = source_lines
+        # Parameter tracking — updated by visit_FunctionDef/visit_AsyncFunctionDef.
+        self._param_names: set[str] = set()
+        self._param_stack: list[set[str]] = []
 
     # ------------------------------------------------------------------
     # Helpers
@@ -62,7 +74,43 @@ class _VulnVisitor(ast.NodeVisitor):
             return self._lines[line - 1].rstrip()
         return ""
 
-    def _add(self, rule: str, severity: str, node: ast.AST, message: str) -> None:
+    def _source_type(self, arg: ast.expr) -> str:
+        """Classify where a vulnerable argument originates.
+
+        Returns one of:
+          "param"      — directly from a function parameter (unvalidated by default)
+          "local"      — a local variable (may have been validated upstream)
+          "expression" — a compound expression; "param" if any sub-name is a param
+          "constant"   — a literal (should have been caught by the constant guard)
+          "unknown"    — not inside a function or type unrecognised
+        """
+        if isinstance(arg, ast.Constant):
+            return "constant"
+        # Not inside any function — caller is at module scope.
+        if not self._param_stack and not self._param_names:
+            return "unknown"
+        if isinstance(arg, ast.Name):
+            return "param" if arg.id in self._param_names else "local"
+        # Compound: f-string, BinOp, Subscript, Call, etc.
+        # Tainted if any direct-Name sub-node is a function parameter.
+        if any(
+            isinstance(n, ast.Name) and n.id in self._param_names
+            for n in ast.walk(arg)
+            if isinstance(n, ast.Name)
+        ):
+            return "param"
+        return "expression"
+
+    def _add(
+        self,
+        rule:     str,
+        severity: str,
+        node:     ast.AST,
+        message:  str,
+        *,
+        vuln_arg: ast.expr | None = None,
+    ) -> None:
+        src = self._source_type(vuln_arg) if vuln_arg is not None else "unknown"
         self.findings.append(Finding(
             rule=rule,
             severity=severity,
@@ -70,6 +118,7 @@ class _VulnVisitor(ast.NodeVisitor):
             col=getattr(node, "col_offset", 0),
             message=message,
             snippet=self._snippet(node),
+            source_type=src,
         ))
 
     @staticmethod
@@ -98,6 +147,12 @@ class _VulnVisitor(ast.NodeVisitor):
         "create_subprocess_shell",
     }
 
+    # Receiver names that suggest a subprocess command list
+    _CMD_LIST_NAMES = frozenset({
+        "cmd", "command", "args", "argv",
+        "proc_args", "cmd_args", "command_args", "shell_cmd",
+    })
+
     def _check_subprocess(self, node: ast.Call) -> None:
         func = node.func
         func_name: str | None = None
@@ -112,21 +167,52 @@ class _VulnVisitor(ast.NodeVisitor):
 
         shell_val = self._get_keyword_value(node, "shell")
         if self._is_true(shell_val):
+            cmd_arg = node.args[0] if node.args else None
             self._add(
                 "SUBPROCESS_SHELL_TRUE", "HIGH", node,
                 f"{func_name}(..., shell=True) — command string is interpreted by the shell; "
                 "any unsanitized input enables command injection.",
+                vuln_arg=cmd_arg,
             )
 
     # ------------------------------------------------------------------
     # R2 — subprocess command list without "--" separator
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _fstring_variable_flag(node: ast.expr) -> str | None:
+        """Return the variable name if *node* is f"--{variable}=..." (flag NAME is a variable).
+
+        Safe  — flag name is a constant:  f"--author={x}"
+                 AST: JoinedStr([Constant("--author="), FormattedValue(Name("x"))])
+                 → first Constant does NOT equal exactly "--" → returns None.
+
+        Unsafe — flag name is a variable: f"--{flag}={x}"
+                 AST: JoinedStr([Constant("--"), FormattedValue(Name("flag")), ...])
+                 → first Constant IS exactly "--" → returns "flag".
+        """
+        if not isinstance(node, ast.JoinedStr) or len(node.values) < 2:
+            return None
+        first = node.values[0]
+        if not (isinstance(first, ast.Constant) and first.value == "--"):
+            return None
+        second = node.values[1]
+        if isinstance(second, ast.FormattedValue) and isinstance(second.value, ast.Name):
+            return second.value.id
+        return None
+
     def _check_missing_dashdash(self, node: ast.Call) -> None:
         """
-        Detects patterns like:
-            cmd.extend(["--author", author])   # author is a variable → git option injection
-        if the list doesn't include a bare "--" sentinel.
+        R2a: cmd.extend(["--flag", variable])  → GIT_OPTION_INJECTION
+             flag value passed as separate token; may be parsed as a new git flag.
+
+        R2b: cmd.append(f"--{flag_var}=...")   → GIT_FLAG_NAME_INJECTION
+             flag NAME is user-controlled; attacker picks which git option to set.
+             (Distinct from R2a: here the flag itself, not just its value, is variable.)
+
+        NOT flagged (safe patterns):
+             ["--", path]           — bare "--" is the end-of-options separator
+             f"--author={author}"   — flag name is a hardcoded constant
         """
         func = node.func
         if not (isinstance(func, ast.Attribute) and func.attr in ("extend", "append")):
@@ -135,13 +221,15 @@ class _VulnVisitor(ast.NodeVisitor):
             return
         arg = node.args[0]
 
-        # extend(["--flag", variable])  — second element is a Name (not a Constant)
+        # R2a: extend(["--flag", variable])
+        # Note: ["--", variable] is the SAFE end-of-options separator — skip it.
         if isinstance(arg, ast.List) and len(arg.elts) == 2:
             flag, value = arg.elts
             if (
                 isinstance(flag, ast.Constant)
                 and isinstance(flag.value, str)
                 and flag.value.startswith("--")
+                and flag.value != "--"   # bare "--" is the safe separator, not a flag
                 and isinstance(value, ast.Name)
             ):
                 self._add(
@@ -149,14 +237,48 @@ class _VulnVisitor(ast.NodeVisitor):
                     f'cmd.extend(["{flag.value}", {value.id}]) — user-controlled value '
                     f'"{value.id}" is passed as the argument to "{flag.value}" without '
                     f'"--" separator; a value like "--upload-pack=x" becomes a git flag.',
+                    vuln_arg=value,
                 )
 
-        # append(variable)  where variable is not a constant
+        # R2b: append(f"--{flag_var}=...") or extend([f"--{flag_var}=..."])
+        # Flag NAME is a variable — attacker controls which git option is set.
+        recv = func.value
+        recv_name = recv.id if isinstance(recv, ast.Name) else "cmd"
+
+        if isinstance(arg, ast.List):
+            # extend([f"--{flag}=...", ...])
+            for elt in arg.elts:
+                flag_var = self._fstring_variable_flag(elt)
+                if flag_var:
+                    self._add(
+                        "GIT_FLAG_NAME_INJECTION", "HIGH", node,
+                        f'{recv_name}.extend([f"--{{{flag_var}}}=..."]) — '
+                        f'the flag name "{flag_var}" is user-controlled; '
+                        f"attacker can inject any git option.",
+                        vuln_arg=elt,
+                    )
+        else:
+            # append(f"--{flag}=...")
+            flag_var = self._fstring_variable_flag(arg)
+            if flag_var:
+                self._add(
+                    "GIT_FLAG_NAME_INJECTION", "HIGH", node,
+                    f'{recv_name}.append(f"--{{{flag_var}}}=...") — '
+                    f'the flag name "{flag_var}" is user-controlled; '
+                    f"attacker can inject any git option.",
+                    vuln_arg=arg,
+                )
+
+        # R2a-append: append(variable) where receiver looks like a subprocess cmd list
         if isinstance(arg, ast.Name):
+            if not (isinstance(recv, ast.Name) and recv.id in self._CMD_LIST_NAMES):
+                return
             self._add(
                 "UNSANITIZED_SUBPROCESS_ARG", "MEDIUM", node,
-                f'cmd.append({arg.id}) — variable "{arg.id}" appended to subprocess '
-                f"command list without validation; may allow path traversal or option injection.",
+                f'{recv.id}.append({arg.id}) — variable "{arg.id}" appended to '
+                f'subprocess command list "{recv.id}" without validation; '
+                f"may allow path traversal or option injection.",
+                vuln_arg=arg,
             )
 
     # ------------------------------------------------------------------
@@ -182,6 +304,7 @@ class _VulnVisitor(ast.NodeVisitor):
                 "OPEN_USER_PATH", "MEDIUM", node,
                 f'open({path_arg.id}) — path comes from variable "{path_arg.id}"; '
                 f"if caller-controlled, path traversal is possible.",
+                vuln_arg=path_arg,
             )
 
     # ------------------------------------------------------------------
@@ -223,6 +346,7 @@ class _VulnVisitor(ast.NodeVisitor):
                     f"create_subprocess_exec(*{arg.value.id}) — command list unpacked from "
                     f'variable "{arg.value.id}"; if user input flows into this list without '
                     f'"--" sentinel, option injection is possible.',
+                    vuln_arg=arg.value,
                 )
 
     # ------------------------------------------------------------------
@@ -253,11 +377,299 @@ class _VulnVisitor(ast.NodeVisitor):
             "LLM_OUTPUT_SINK", "MEDIUM", node,
             f"json.{func.attr}({arg_repr}) — deserializes a non-literal value; "
             "if the source is LLM output or external input, validate schema before parsing.",
+            vuln_arg=first_arg,
+        )
+
+    # ------------------------------------------------------------------
+    # R7 — eval() / exec() with non-constant argument
+    # ------------------------------------------------------------------
+
+    _EVAL_EXEC_FUNCS = {"eval", "exec"}
+
+    def _check_eval_exec(self, node: ast.Call) -> None:
+        func = node.func
+        if not (isinstance(func, ast.Name) and func.id in self._EVAL_EXEC_FUNCS):
+            return
+        if not node.args:
+            return
+        arg = node.args[0]
+        if isinstance(arg, ast.Constant):
+            return  # hardcoded string — safe
+        arg_repr = getattr(arg, "id", None) or ast.unparse(arg)
+        self._add(
+            "UNSAFE_EVAL_EXEC", "HIGH", node,
+            f"{func.id}({arg_repr}) — executes a non-literal expression; "
+            "if caller-controlled, this is arbitrary code execution.",
+            vuln_arg=arg,
+        )
+
+    # ------------------------------------------------------------------
+    # R8 — pickle.loads() / pickle.load() with non-constant argument
+    # ------------------------------------------------------------------
+
+    def _check_unsafe_pickle(self, node: ast.Call) -> None:
+        func = node.func
+        if not (
+            isinstance(func, ast.Attribute)
+            and func.attr in ("loads", "load")
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "pickle"
+        ):
+            return
+        if not node.args:
+            return
+        arg = node.args[0]
+        if isinstance(arg, ast.Constant):
+            return
+        arg_repr = getattr(arg, "id", None) or ast.unparse(arg)
+        self._add(
+            "UNSAFE_PICKLE", "HIGH", node,
+            f"pickle.{func.attr}({arg_repr}) — deserializes arbitrary Python objects; "
+            "pickle executes code during deserialization, making any untrusted "
+            "source exploitable regardless of surrounding try/except.",
+            vuln_arg=arg,
+        )
+
+    # ------------------------------------------------------------------
+    # R9 — yaml.load() without SafeLoader / yaml.full_load()
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _has_safe_loader(call: ast.Call) -> bool:
+        """Return True if the call has Loader=yaml.SafeLoader keyword."""
+        for kw in call.keywords:
+            if kw.arg != "Loader":
+                continue
+            v = kw.value
+            # yaml.SafeLoader  (Attribute)
+            if isinstance(v, ast.Attribute) and v.attr == "SafeLoader":
+                return True
+            # SafeLoader  (bare Name import)
+            if isinstance(v, ast.Name) and v.id == "SafeLoader":
+                return True
+        return False
+
+    def _check_unsafe_yaml(self, node: ast.Call) -> None:
+        func = node.func
+        if not (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "yaml"
+        ):
+            return
+
+        if func.attr == "safe_load":
+            return  # safe by design
+
+        if func.attr == "load":
+            if self._has_safe_loader(node):
+                return  # explicitly safe
+            arg_repr = (
+                getattr(node.args[0], "id", None) or ast.unparse(node.args[0])
+            ) if node.args else "?"
+            yaml_arg = node.args[0] if node.args else None
+            self._add(
+                "UNSAFE_YAML_LOAD", "HIGH", node,
+                f"yaml.load({arg_repr}) without Loader=yaml.SafeLoader — "
+                "can deserialize and execute arbitrary Python objects via YAML tags. "
+                "Use yaml.safe_load() or pass Loader=yaml.SafeLoader explicitly.",
+                vuln_arg=yaml_arg,
+            )
+
+        elif func.attr == "full_load":
+            arg_repr = (
+                getattr(node.args[0], "id", None) or ast.unparse(node.args[0])
+            ) if node.args else "?"
+            yaml_arg = node.args[0] if node.args else None
+            self._add(
+                "UNSAFE_YAML_LOAD", "MEDIUM", node,
+                f"yaml.full_load({arg_repr}) — resolves Python-specific YAML tags; "
+                "safer than yaml.load() but not equivalent to yaml.safe_load(). "
+                "Prefer yaml.safe_load() for untrusted input.",
+                vuln_arg=yaml_arg,
+            )
+
+    # ------------------------------------------------------------------
+    # R10 — os.system() / os.popen() with non-constant argument
+    # ------------------------------------------------------------------
+
+    _OS_SHELL_FUNCS = {"system", "popen"}
+
+    def _check_os_shell(self, node: ast.Call) -> None:
+        func = node.func
+        if not (
+            isinstance(func, ast.Attribute)
+            and func.attr in self._OS_SHELL_FUNCS
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "os"
+        ):
+            return
+        if not node.args:
+            return
+        arg = node.args[0]
+        if isinstance(arg, ast.Constant):
+            return  # hardcoded command — safe
+        arg_repr = getattr(arg, "id", None) or ast.unparse(arg)
+        self._add(
+            "OS_SHELL_INJECTION", "HIGH", node,
+            f"os.{func.attr}({arg_repr}) — passes a non-literal string to the shell; "
+            "any unsanitized input enables command injection. "
+            "Use subprocess.run([...]) with a list instead.",
+            vuln_arg=arg,
+        )
+
+    # ------------------------------------------------------------------
+    # R11 — requests.<method>() with a non-constant URL (SSRF)
+    # ------------------------------------------------------------------
+
+    _REQUESTS_METHODS = frozenset({
+        "get", "post", "put", "delete", "patch", "head", "options", "request",
+    })
+
+    def _check_ssrf(self, node: ast.Call) -> None:
+        func = node.func
+        if not (
+            isinstance(func, ast.Attribute)
+            and func.attr in self._REQUESTS_METHODS
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "requests"
+        ):
+            return
+        if not node.args:
+            return
+        # requests.request("GET", url) — URL is the second positional arg
+        url_idx = 1 if func.attr == "request" else 0
+        if len(node.args) <= url_idx:
+            return
+        url_arg = node.args[url_idx]
+        if isinstance(url_arg, ast.Constant):
+            return  # hardcoded URL — not SSRF
+        arg_repr = getattr(url_arg, "id", None) or ast.unparse(url_arg)
+        self._add(
+            "SSRF", "HIGH", node,
+            f"requests.{func.attr}({arg_repr}) — URL argument is not a constant; "
+            "if caller-controlled this enables Server-Side Request Forgery (SSRF). "
+            "Validate URL against an allowlist or use a URL parser with schema enforcement.",
+            vuln_arg=url_arg,
+        )
+
+    # ------------------------------------------------------------------
+    # R12 — Template(non_const) / env.from_string(non_const)  (SSTI)
+    # ------------------------------------------------------------------
+
+    def _check_template_injection(self, node: ast.Call) -> None:
+        """Detect Server-Side Template Injection (SSTI) sources.
+
+        Two patterns:
+        A. Template(non_constant) — user controls the template *string*.
+           Matches any bare ``Template(...)`` call and ``<module>.Template(...)``
+           (covers jinja2.Template, mako.template.Template, etc.)
+        B. <env>.from_string(non_constant) — Jinja2 Environment.from_string with
+           a non-literal string.
+
+        Rendering with user *data* (template.render(name=user_input)) is NOT
+        flagged here because the template string itself is fixed and safe.
+        """
+        func = node.func
+        if not node.args:
+            return
+        first_arg = node.args[0]
+        if isinstance(first_arg, ast.Constant):
+            return  # hardcoded template string — safe
+
+        arg_repr = getattr(first_arg, "id", None) or ast.unparse(first_arg)
+
+        # Pattern A: Template(non_const) or <module>.Template(non_const)
+        if isinstance(func, ast.Name) and func.id == "Template":
+            call_repr = f"Template({arg_repr})"
+        elif isinstance(func, ast.Attribute) and func.attr == "Template":
+            mod = ast.unparse(func.value)
+            call_repr = f"{mod}.Template({arg_repr})"
+        # Pattern B: <env>.from_string(non_const)
+        elif isinstance(func, ast.Attribute) and func.attr == "from_string":
+            env_repr = ast.unparse(func.value)
+            call_repr = f"{env_repr}.from_string({arg_repr})"
+        else:
+            return
+
+        self._add(
+            "TEMPLATE_INJECTION", "HIGH", node,
+            f"{call_repr} — the template string is not a constant; "
+            "if caller-controlled this enables Server-Side Template Injection (SSTI): "
+            "arbitrary code execution via template expressions such as {{{{7*7}}}} or "
+            "{{{{''.__class__.__mro__}}}}. "
+            "Never pass user input as a template string; pass it only as context variables "
+            "to a fixed, trusted template in render().",
+            vuln_arg=first_arg,
+        )
+
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # R13 — re.<func>(non_constant_pattern)  (ReDoS)
+    # ------------------------------------------------------------------
+
+    _RE_FUNCS = frozenset({
+        "compile", "match", "search", "fullmatch",
+        "findall", "finditer", "sub", "subn", "split",
+    })
+
+    def _check_regex_dos(self, node: ast.Call) -> None:
+        """Detect ReDoS: re.* called with a user-controlled pattern (first arg).
+
+        The *pattern* is always the first positional argument to every re.*
+        function.  If it is not a string literal, an attacker can supply a
+        catastrophically backtracking pattern (e.g. ``(a+)+$``) that causes
+        exponential CPU usage proportional to input length.
+
+        Note: this flags the *pattern* source, not the *string* being matched.
+        ``re.match(r"fixed", user_string)`` is safe and is NOT flagged.
+        """
+        func = node.func
+        if not (
+            isinstance(func, ast.Attribute)
+            and func.attr in self._RE_FUNCS
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "re"
+        ):
+            return
+        if not node.args:
+            return
+        pattern_arg = node.args[0]
+        if isinstance(pattern_arg, ast.Constant):
+            return  # hardcoded pattern — safe
+        arg_repr = getattr(pattern_arg, "id", None) or ast.unparse(pattern_arg)
+        self._add(
+            "REGEX_DOS", "HIGH", node,
+            f"re.{func.attr}({arg_repr}) — the regex pattern is not a constant; "
+            "if caller-controlled an attacker can supply a catastrophically "
+            "backtracking expression (ReDoS) causing exponential CPU usage. "
+            "Compile patterns from constants only; validate or reject untrusted "
+            "input before using it as a regular expression.",
+            vuln_arg=pattern_arg,
         )
 
     # ------------------------------------------------------------------
     # Visitors
     # ------------------------------------------------------------------
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        """Track parameter names so _source_type() can classify vulnerable args."""
+        all_args = (
+            node.args.posonlyargs
+            + node.args.args
+            + node.args.kwonlyargs
+        )
+        if node.args.vararg:
+            all_args = all_args + [node.args.vararg]
+        if node.args.kwarg:
+            all_args = all_args + [node.args.kwarg]
+        params = {a.arg for a in all_args}
+        self._param_stack.append(self._param_names)
+        self._param_names = params
+        self.generic_visit(node)
+        self._param_names = self._param_stack.pop()
+
+    visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
 
     def visit_Call(self, node: ast.Call) -> None:
         self._check_subprocess(node)
@@ -265,6 +677,13 @@ class _VulnVisitor(ast.NodeVisitor):
         self._check_open(node)
         self._check_create_subprocess_exec(node)
         self._check_llm_output_sink(node)
+        self._check_eval_exec(node)
+        self._check_unsafe_pickle(node)
+        self._check_unsafe_yaml(node)
+        self._check_os_shell(node)
+        self._check_ssrf(node)
+        self._check_template_injection(node)
+        self._check_regex_dos(node)
         self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign) -> None:
@@ -370,11 +789,12 @@ class ASTAnalyzerTool(BaseTool):
                 "findings_count": len(findings),
                 "findings": [
                     {
-                        "rule":     f.rule,
-                        "severity": f.severity,
-                        "line":     f.line,
-                        "message":  f.message,
-                        "snippet":  f.snippet,
+                        "rule":        f.rule,
+                        "severity":    f.severity,
+                        "line":        f.line,
+                        "message":     f.message,
+                        "snippet":     f.snippet,
+                        "source_type": f.source_type,
                     }
                     for f in findings
                 ],
