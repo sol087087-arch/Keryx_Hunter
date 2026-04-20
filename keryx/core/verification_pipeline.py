@@ -145,34 +145,39 @@ class VerificationPipeline:
             seen.setdefault(m.group(1), None)
         return list(seen)
 
-    async def _fuzz_verify(self, codeql_observation: str) -> bool:
+    async def _fuzz_verify(self, codeql_observation: str) -> tuple[bool, str]:
         """Fallback for external targets: run fuzzer PoC for each HIGH rule.
 
-        Returns True if any PoC reproduces the exploit marker in a sandboxed
-        subprocess.  Result is logged but not written to context (Phase 1.5
-        fuzz pass handles the full record).
+        Returns (confirmed, verification_level) where level is one of:
+          "exploited" — exploit marker found in output
+          "triggered" — anomalous behaviour (timeout / crash) without marker
+          "reachable" — code path reached, no anomaly
         """
         from ..fuzzing.poc import reproduce   # local import — avoids circular dep
 
         rules = self._extract_high_rules(codeql_observation)
         if not rules:
             print("[FuzzVerify] No HIGH rules to probe — AST-only.")
-            return False
+            return False, "reachable"
 
+        best_level = "reachable"
         for rule in rules:
             poc = reproduce({"rule": rule}, timeout=10)
             if poc.reproduced:
                 print(
-                    f"[FuzzVerify] CONFIRMED — rule={rule}  "
-                    f"elapsed={poc.elapsed_s:.2f}s  marker={poc.marker}"
+                    f"[FuzzVerify] CONFIRMED — rule={rule}  level={poc.verification_level}"
+                    f"  elapsed={poc.elapsed_s:.2f}s  marker={poc.marker}"
                 )
-                return True
+                return True, poc.verification_level
             if poc.error:
                 print(f"[FuzzVerify] skip {rule}: {poc.error}")
             else:
-                print(f"[FuzzVerify] not reproduced — rule={rule}  ({poc.elapsed_s:.2f}s)")
+                print(f"[FuzzVerify] not reproduced — rule={rule}  level={poc.verification_level}"
+                      f"  ({poc.elapsed_s:.2f}s)")
+                if poc.verification_level == "triggered" and best_level == "reachable":
+                    best_level = "triggered"
 
-        return False
+        return False, best_level
 
     # ------------------------------------------------------------------
     # Async verification
@@ -192,8 +197,8 @@ class VerificationPipeline:
 
         target_tool = self.resolve_target_tool()
         if target_tool is None:
-            confirmed = await self._fuzz_verify(codeql_observation)
-            return confirmed, "fuzz_poc"
+            confirmed, level = await self._fuzz_verify(codeql_observation)
+            return confirmed, f"fuzz_poc:{level}"
 
         findings = self.extract_findings(codeql_observation)
         if not findings:

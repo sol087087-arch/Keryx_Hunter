@@ -1,5 +1,102 @@
 # Keryx Hunter — Session Change Report
 
+---
+
+## Сессия 2026-04-18 (рефакторинг монолита + фиксы)
+
+**Ветка:** `v2`  
+**Коммит на момент начала:** `c29db43` — "chore: prepare for project_hunt refactoring"
+
+### Функциональные изменения
+
+#### R12 TEMPLATE_INJECTION — точный детект алиасов
+
+**Файл:** `keryx/tools/ast_analyzer.py`
+
+Исправлена ложная пропасть: `from jinja2 import Template as T; T(x)` не детектировалось. `import jinja2 as j; j.Template(x)` давало MEDIUM вместо HIGH.
+
+- Добавлены `_ssti_aliases: set[str]` и `_module_aliases: dict[str, str]` в `_VulnVisitor.__init__`
+- `visit_ImportFrom` заполняет `_ssti_aliases` при импорте `Template` из опасного модуля под любым псевдонимом
+- `visit_Import` отслеживает `import jinja2 as j` → `_module_aliases["j"] = "jinja2"`
+- Паттерн A (голый вызов `Template`): HIGH если имя в `_ssti_aliases`, MEDIUM если модуль неизвестен
+- Паттерн A (qualified `mod.Template`): разрешает алиасы модулей, HIGH/MEDIUM по каноническому имени
+- Паттерн B (`from_string`): HIGH только для известных шаблонных движков — убраны ложные срабатывания на `LlamaGrammar.from_string` и подобные
+
+#### Трёхуровневая верификация PoC
+
+**Файл:** `keryx/fuzzing/poc.py` — добавлено поле `verification_level: Literal["reachable", "triggered", "exploited"]` в `PoCResult`.
+
+- `exploited` — маркер найден в stdout (доказанное выполнение)
+- `triggered` — ненулевой exit code или timeout (потенциальное срабатывание, покрывает REGEX_DOS)
+- `reachable` — процесс запустился, маркер не найден
+
+**Файл:** `keryx/core/verification_pipeline.py` — `_fuzz_verify` теперь возвращает `tuple[bool, str]`. `auto_verify` кодирует уровень в `method_tag`: `"fuzz_poc:exploited"` / `"fuzz_poc:triggered"` / `"fuzz_poc:reachable"`.
+
+#### Rule Routing Weights
+
+**Файл:** `keryx/core/hunt_models.py`
+
+- Добавлен `RULE_ROUTING_WEIGHT: dict[str, float]` — множители приоритета для отдельных правил
+- Добавлена функция `routing_score(sr: ScanResult) -> float` — применяет максимальный вес к итоговому скору при сортировке перед Phase 1 (не влияет на отображаемый AST-скор)
+
+---
+
+### Рефакторинг: разбиение монолита `project_hunt.py`
+
+До рефакторинга в `scripts/project_hunt.py` было ~1427 строк — весь код в одном месте. После — 350 строк (CLI + `main()` + координация).
+
+#### Новый файл: `keryx/core/scan_pipeline.py`
+
+Перенесено из `project_hunt.py`:
+- `load_cache`, `save_cache` — инкрементальный кэш Phase 0a
+- `git_head(repo_root)`, `git_changed_since(commit, repo_root)` — инвалидация кэша по git
+- `parse_ast_findings`, `scan_directory(..., repo_root, ...)` — параллельное AST-сканирование
+- `enrich_with_blame(results, repo_root, scorer, since_days)` — git-обогащение Phase 0b
+- Константы `CACHE_VERSION`, `EXCLUDE_ALWAYS`
+
+Ключевое: все функции принимают `repo_root: Path` явно — глобальная переменная `_REPO_ROOT` не используется внутри модуля.
+
+#### Новый файл: `keryx/core/hunt_pipeline.py`
+
+Перенесено из `project_hunt.py`:
+- `MODEL_IDS`, `STEPS_DEFAULT = 10`, `STEPS_ESCALATE = 15`
+- `_load_api_key(repo_root)`, `build_model(model_name, budget, repo_root, scripted)`
+- `hunt_file(scan, model, mode, max_steps, model_label, repo_root, ...)`
+
+Новые публичные функции:
+- `run_escalate_tier(...)` — Phase 1a: последовательный hunt для топ-файлов
+- `run_default_tier(...)` — Phase 1b: параллельный hunt для остальных
+- `run_escalation_phase(...)` — Phase 1c: авто-эскалация inconclusive HIGH + бюджет-гард
+
+#### Итоговое состояние модулей
+
+| Файл | Ответственность |
+|---|---|
+| `keryx/core/hunt_models.py` | Датаклассы, скоринг, routing weights |
+| `keryx/models/scripted.py` | Детерминированная fallback-модель |
+| `keryx/core/reporters.py` | Весь вывод: консоль, JSON, SARIF, HTML |
+| `keryx/core/scan_pipeline.py` | Phase 0a/0b: AST-скан + git-обогащение |
+| `keryx/core/hunt_pipeline.py` | Phase 1a/1b/1c: построение моделей + тиры |
+| `scripts/project_hunt.py` | CLI, `main()`, координация (350 строк) |
+
+---
+
+### Тесты
+
+Исправлены после изменения `_fuzz_verify` (теперь возвращает `tuple`):
+- `test_auto_verify_no_target_tool`
+- `test_returns_false_when_tool_not_resolved`
+- `test_tool_not_resolved_fuzz_confirmed`
+
+Исправлен `TestHtmlReport.test_vuln_row_rendered` и `test_xss_escaped_in_message` — импорт `ScanResult`, `HuntResult` перенесён с `scripts.project_hunt` на `keryx.core.hunt_models`.
+
+**Итог: 1112 тестов, все проходят, coverage 88.5%.**
+
+---
+---
+
+## Предыдущая сессия — добавление capability-слоёв
+
 **Branch:** `v2`  
 **Baseline commit:** `dde94da` — "fix: update import test cascade_advisor → cascade (post-reset cleanup)"  
 **Report date:** 2026-04-18

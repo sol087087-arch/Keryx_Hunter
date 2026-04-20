@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Literal
 
 from . import harness, sandbox
 
@@ -23,6 +23,11 @@ class PoCResult:
     elapsed_s: float = 0.0
     error: str | None = None
     harness_script: str = field(default="", repr=False)  # full script, for debugging
+    # How strongly the exploit was confirmed:
+    #   "reachable" — code path reached, no anomalous behaviour observed
+    #   "triggered" — anomalous behaviour (timeout / non-zero exit) without marker
+    #   "exploited" — exploit marker found in stdout/stderr
+    verification_level: Literal["reachable", "triggered", "exploited"] = "reachable"
 
 
 def reproduce(
@@ -54,15 +59,23 @@ def reproduce(
     combined   = result.stdout + result.stderr
     reproduced = marker in combined
 
+    if reproduced:
+        level = "exploited"
+    elif result.timed_out or (result.exit_code is not None and result.exit_code != 0):
+        level = "triggered"
+    else:
+        level = "reachable"
+
     return PoCResult(
-        rule            = rule,
-        reproduced      = reproduced,
-        payload         = marker,
-        marker          = marker,
-        stdout          = result.stdout[:2000],
-        stderr          = result.stderr[:1000],
-        exit_code       = result.exit_code,
-        confidence_boost= _CONFIDENCE_BOOST if reproduced else 0.0,
-        elapsed_s       = result.elapsed_s,
-        harness_script  = script,
+        rule               = rule,
+        reproduced         = reproduced,
+        payload            = marker,
+        marker             = marker,
+        stdout             = result.stdout[:2000],
+        stderr             = result.stderr[:1000],
+        exit_code          = result.exit_code,
+        confidence_boost   = _CONFIDENCE_BOOST if reproduced else 0.0,
+        elapsed_s          = result.elapsed_s,
+        harness_script     = script,
+        verification_level = level,
     )

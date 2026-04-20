@@ -63,6 +63,17 @@ class _VulnVisitor(ast.NodeVisitor):
         # Parameter tracking — updated by visit_FunctionDef/visit_AsyncFunctionDef.
         self._param_names: set[str] = set()
         self._param_stack: list[set[str]] = []
+        # Import tracking for SSTI detection.
+        # _name_to_module:  local name → originating module
+        #   "from jinja2 import Template" → {"Template": "jinja2"}
+        #   "from jinja2 import Template as T" → {"T": "jinja2"}
+        # _ssti_aliases:    local names that ARE known SSTI template classes (HIGH)
+        #   "from jinja2 import Template as T" → {"T"}
+        # _module_aliases:  local module alias → canonical module name
+        #   "import jinja2 as j" → {"j": "jinja2"}
+        self._name_to_module: dict[str, str] = {}
+        self._ssti_aliases:   set[str]       = set()
+        self._module_aliases: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Helpers
@@ -557,15 +568,22 @@ class _VulnVisitor(ast.NodeVisitor):
     # R12 — Template(non_const) / env.from_string(non_const)  (SSTI)
     # ------------------------------------------------------------------
 
+    # Known template engines that support code-execution expressions (e.g. {{7*7}})
+    _SSTI_MODULES = {"jinja2", "mako", "chameleon", "django.template"}
+    # from_string() callers that are genuine template environments
+    _SSTI_ENV_NAMES = {"env", "environment", "jinja_env", "jinja2_env", "template_env"}
+
     def _check_template_injection(self, node: ast.Call) -> None:
         """Detect Server-Side Template Injection (SSTI) sources.
 
         Two patterns:
-        A. Template(non_constant) — user controls the template *string*.
-           Matches any bare ``Template(...)`` call and ``<module>.Template(...)``
-           (covers jinja2.Template, mako.template.Template, etc.)
-        B. <env>.from_string(non_constant) — Jinja2 Environment.from_string with
-           a non-literal string.
+        A. Template(non_constant) or <module>.Template(non_constant):
+           HIGH only for known dangerous template engines (jinja2, mako, chameleon,
+           django.template).  Bare Template(...) with unknown import → MEDIUM.
+        B. <env>.from_string(non_constant):
+           HIGH only when the receiver is a known Jinja2 Environment or a variable
+           whose name suggests a template env.  All other .from_string() callers
+           (e.g. LlamaGrammar.from_string) are skipped — not a template engine.
 
         Rendering with user *data* (template.render(name=user_input)) is NOT
         flagged here because the template string itself is fixed and safe.
@@ -579,29 +597,77 @@ class _VulnVisitor(ast.NodeVisitor):
 
         arg_repr = getattr(first_arg, "id", None) or ast.unparse(first_arg)
 
-        # Pattern A: Template(non_const) or <module>.Template(non_const)
-        if isinstance(func, ast.Name) and func.id == "Template":
-            call_repr = f"Template({arg_repr})"
-        elif isinstance(func, ast.Attribute) and func.attr == "Template":
-            mod = ast.unparse(func.value)
-            call_repr = f"{mod}.Template({arg_repr})"
-        # Pattern B: <env>.from_string(non_const)
-        elif isinstance(func, ast.Attribute) and func.attr == "from_string":
-            env_repr = ast.unparse(func.value)
-            call_repr = f"{env_repr}.from_string({arg_repr})"
-        else:
+        # Pattern A — bare name: Template(non_const) or any aliased SSTI class
+        if isinstance(func, ast.Name) and (
+            func.id == "Template" or func.id in self._ssti_aliases
+        ):
+            origin = self._name_to_module.get(func.id, "")
+            is_dangerous = (
+                func.id in self._ssti_aliases
+                or any(engine in origin for engine in self._SSTI_MODULES)
+            )
+            if is_dangerous:
+                src_note = f" (imported from {origin!r})" if origin else ""
+                self._add(
+                    "TEMPLATE_INJECTION", "HIGH", node,
+                    f"{func.id}({arg_repr}){src_note} — template string is not a constant; "
+                    "caller-controlled input enables SSTI (arbitrary code execution) via "
+                    "expressions such as {{{{7*7}}}} or {{{{''.__class__.__mro__}}}}. "
+                    "Never pass user input as a template string.",
+                    vuln_arg=first_arg,
+                )
+            else:
+                # Unknown or safe import (e.g. string.Template) → MEDIUM
+                self._add(
+                    "TEMPLATE_INJECTION", "MEDIUM", node,
+                    f"Template({arg_repr}) — template string is not a constant; "
+                    "if this is jinja2.Template or mako.template.Template and the string "
+                    "is caller-controlled, SSTI (arbitrary code execution) is possible. "
+                    "Verify the import and pass user input only as render() context.",
+                    vuln_arg=first_arg,
+                )
             return
 
-        self._add(
-            "TEMPLATE_INJECTION", "HIGH", node,
-            f"{call_repr} — the template string is not a constant; "
-            "if caller-controlled this enables Server-Side Template Injection (SSTI): "
-            "arbitrary code execution via template expressions such as {{{{7*7}}}} or "
-            "{{{{''.__class__.__mro__}}}}. "
-            "Never pass user input as a template string; pass it only as context variables "
-            "to a fixed, trusted template in render().",
-            vuln_arg=first_arg,
-        )
+        # Pattern A — qualified: <module>.Template(non_const)
+        if isinstance(func, ast.Attribute) and func.attr == "Template":
+            raw_mod = ast.unparse(func.value)
+            # Resolve module alias: "j.Template" where j = jinja2 → jinja2.Template
+            mod_name = getattr(func.value, "id", None) or ""
+            canonical = self._module_aliases.get(mod_name, raw_mod)
+            if any(engine in canonical for engine in self._SSTI_MODULES):
+                self._add(
+                    "TEMPLATE_INJECTION", "HIGH", node,
+                    f"{raw_mod}.Template({arg_repr}) — template string is not a constant; "
+                    "caller-controlled input enables SSTI (arbitrary code execution) via "
+                    "expressions such as {{{{7*7}}}} or {{{{''.__class__.__mro__}}}}. "
+                    "Never pass user input as a template string.",
+                    vuln_arg=first_arg,
+                )
+            else:
+                self._add(
+                    "TEMPLATE_INJECTION", "MEDIUM", node,
+                    f"{raw_mod}.Template({arg_repr}) — template string is not a constant; "
+                    "if this module supports code-execution expressions, SSTI is possible.",
+                    vuln_arg=first_arg,
+                )
+            return
+
+        # Pattern B: <env>.from_string(non_const) — only known template envs
+        if isinstance(func, ast.Attribute) and func.attr == "from_string":
+            env_repr = ast.unparse(func.value)
+            env_name = getattr(func.value, "id", "") or ""
+            is_known_env = (
+                any(engine in env_repr for engine in self._SSTI_MODULES)
+                or env_name.lower() in self._SSTI_ENV_NAMES
+            )
+            if is_known_env:
+                self._add(
+                    "TEMPLATE_INJECTION", "HIGH", node,
+                    f"{env_repr}.from_string({arg_repr}) — template string is not a constant; "
+                    "caller-controlled input enables SSTI. "
+                    "Never pass user input as a template string; use render() context only.",
+                    vuln_arg=first_arg,
+                )
 
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
@@ -670,6 +736,30 @@ class _VulnVisitor(ast.NodeVisitor):
         self._param_names = self._param_stack.pop()
 
     visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
+
+    def visit_Import(self, node: ast.Import) -> None:
+        """Track 'import X as Y' module aliases for SSTI detection."""
+        for alias in node.names:
+            if alias.asname:
+                self._module_aliases[alias.asname] = alias.name
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        """Track 'from X import Y [as Z]' for SSTI detection.
+
+        Populates _name_to_module and _ssti_aliases so that aliased
+        imports like 'from jinja2 import Template as T' are caught.
+        """
+        if node.module:
+            for alias in node.names:
+                local_name = alias.asname if alias.asname else alias.name
+                self._name_to_module[local_name] = node.module
+                # Mark as confirmed SSTI class if it's Template from a dangerous engine
+                if alias.name == "Template" and any(
+                    engine in node.module for engine in self._SSTI_MODULES
+                ):
+                    self._ssti_aliases.add(local_name)
+        self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
         self._check_subprocess(node)

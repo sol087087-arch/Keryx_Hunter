@@ -10280,10 +10280,10 @@ class TestAgentMissingLinePaths:
                            toolbox=tb, max_steps=1)
         agent.context = SharedContext(target_path="/tmp/unmatched.py")
         with patch("keryx.core.verification_pipeline.VerificationPipeline._fuzz_verify",
-                   return_value=False):
+                   return_value=(False, "reachable")):
             confirmed, method = await agent._auto_verify_injection(self._HIGH_CQ)
         assert confirmed is False
-        assert method == "fuzz_poc"
+        assert method == "fuzz_poc:reachable"
         tb.shutdown()
 
     @pytest.mark.asyncio
@@ -12319,16 +12319,19 @@ class TestHtmlReport:
 
     @staticmethod
     def _write(all_results=None, all_hunts=None, models=None, *, path: Path) -> None:
-        import sys as _sys
-        _sys.path.insert(0, str(Path(__file__).parent.parent))
-        from scripts.project_hunt import write_output_html  # type: ignore[import]
-        write_output_html(
-            str(path),
-            all_results or [],
-            all_hunts  or [],
-            models     or {},
-            budget=0.50, total_s=3.14,
+        from keryx.core.reporters import write_output_html
+        from keryx.core.hunt_models import ReportContext
+        ctx = ReportContext(
+            repo_root=Path(__file__).parent.parent,
+            escalate_model="opus",
+            default_model="haiku",
+            budget_limit_usd=0.50,
+            scan_results=all_results or [],
+            hunts=all_hunts or [],
+            models=models or {},
+            total_elapsed_s=3.14,
         )
+        write_output_html(str(path), ctx)
 
     def test_creates_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -12351,9 +12354,7 @@ class TestHtmlReport:
             assert "Confirmed Vulns" in text
 
     def test_vuln_row_rendered(self) -> None:
-        import sys as _sys
-        _sys.path.insert(0, str(Path(__file__).parent.parent))
-        from scripts.project_hunt import ScanResult, HuntResult  # type: ignore[import]
+        from keryx.core.hunt_models import ScanResult, HuntResult
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "report.html"
             scan = ScanResult(file=Path("keryx/tools/ast_analyzer.py"),
@@ -12377,9 +12378,7 @@ class TestHtmlReport:
             assert "No confirmed vulnerabilities" in p.read_text(encoding="utf-8")
 
     def test_xss_escaped_in_message(self) -> None:
-        import sys as _sys
-        _sys.path.insert(0, str(Path(__file__).parent.parent))
-        from scripts.project_hunt import ScanResult, HuntResult  # type: ignore[import]
+        from keryx.core.hunt_models import ScanResult, HuntResult
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "report.html"
             scan = ScanResult(file=Path("keryx/tools/ast_analyzer.py"),

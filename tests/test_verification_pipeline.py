@@ -214,10 +214,10 @@ class TestAutoVerify:
         not_reproduced = PoCResult(rule="GIT_OPTION_INJECTION", reproduced=False,
                                    payload="", marker="M")
         with patch("keryx.core.verification_pipeline.VerificationPipeline._fuzz_verify",
-                   return_value=False):
+                   return_value=(False, "reachable")):
             confirmed, method = await vp.auto_verify(_GIT_OPTION_OBS)
         assert confirmed is False
-        assert method == "fuzz_poc"
+        assert method == "fuzz_poc:reachable"
         tb.shutdown()
 
     @pytest.mark.asyncio
@@ -227,10 +227,10 @@ class TestAutoVerify:
         tb = create_toolbox(tools=[_InjectionVerifier(confirm=True)])
         vp = VerificationPipeline(tb, _ctx("/tmp/git_blame.py"))
         with patch("keryx.core.verification_pipeline.VerificationPipeline._fuzz_verify",
-                   return_value=True):
+                   return_value=(True, "exploited")):
             confirmed, method = await vp.auto_verify(_GIT_OPTION_OBS)
         assert confirmed is True
-        assert method == "fuzz_poc"
+        assert method == "fuzz_poc:exploited"
         tb.shutdown()
 
     @pytest.mark.asyncio

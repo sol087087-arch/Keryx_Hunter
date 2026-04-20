@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Keryx Hunt Report</title>
+<style>
+  body{font-family:system-ui,sans-serif;margin:0;background:#f5f6fa;color:#222}
+  header{background:#1a1a2e;color:#fff;padding:1.2rem 2rem}
+  header h1{margin:0;font-size:1.6rem;letter-spacing:.5px}
+  header p{margin:.3rem 0 0;opacity:.7;font-size:.9rem}
+  .summary{display:flex;gap:1.2rem;flex-wrap:wrap;padding:1.2rem 2rem}
+  .card{background:#fff;border-radius:8px;padding:1rem 1.4rem;box-shadow:0 1px 4px rgba(0,0,0,.08);min-width:130px}
+  .card .val{font-size:2rem;font-weight:700;margin:0}
+  .card .lbl{font-size:.78rem;color:#666;margin-top:.2rem}
+  section{padding:.8rem 2rem 1.4rem}
+  h2{font-size:1.15rem;border-bottom:2px solid #e0e0e0;padding-bottom:.4rem;margin-bottom:.8rem}
+  table{border-collapse:collapse;width:100%;background:#fff;border-radius:8px;
+         overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.07);font-size:.88rem}
+  th{background:#eef;text-align:left;padding:.55rem .8rem;white-space:nowrap}
+  td{padding:.5rem .8rem;border-top:1px solid #eee;vertical-align:top;word-break:break-word}
+  tr:hover td{background:#fafafa}
+  code{font-size:.82em;background:#f0f0f0;padding:1px 4px;border-radius:3px}
+  .empty{color:#888;font-style:italic;padding:.8rem 0}
+  footer{padding:1rem 2rem;font-size:.78rem;color:#999;border-top:1px solid #e0e0e0}
+</style>
+</head>
+<body>
+<header>
+  <h1>Keryx Security Hunt Report</h1>
+  <p>Generated 2026-04-19 18:05 UTC &nbsp;|&nbsp; Budget $0.50 &nbsp;|&nbsp;
+     Elapsed 75.4s &nbsp;|&nbsp; Cost $0.2504</p>
+</header>
+
+<div class="summary">
+  <div class="card"><p class="val">11</p><p class="lbl">Files Scanned</p></div>
+  <div class="card"><p class="val">11</p><p class="lbl">Files Hunted</p></div>
+  <div class="card"><p class="val">5</p><p class="lbl">Confirmed Vulns</p></div>
+  <div class="card"><p class="val">5</p><p class="lbl">Dynamically Verified</p></div>
+</div>
+
+<section>
+  <h2>Confirmed Vulnerabilities</h2>
+  
+  <table>
+    <thead><tr>
+      <th>Severity</th><th>Rule</th><th>Location</th>
+      <th>Message</th><th>Source type</th><th>Verified</th>
+    </tr></thead>
+    <tbody><tr><td><span style="background:#d68910;color:#fff;padding:2px 7px;border-radius:4px;font-size:0.78em;font-weight:bold;">MEDIUM</span></td><td><code>REGEX_DOS</code></td><td><code>keryx/tools/fuzzer.py:</code></td><td>[AST] 4 finding(s) in fuzzer.py (480 lines analyzed):
+
+  [1] [HIGH] REGEX_DOS @ line 71: re.search(pat) — the regex pattern is not a constant; if caller-controlled an attacker can supply a catastrophi</td><td></td><td>Yes</td></tr><tr><td><span style="background:#d68910;color:#fff;padding:2px 7px;border-radius:4px;font-size:0.78em;font-weight:bold;">MEDIUM</span></td><td><code>REGEX_DOS</code></td><td><code>keryx/advisors/cloud_advisor.py:</code></td><td>[AST] 2 finding(s) in cloud_advisor.py (466 lines analyzed):
+
+  [1] [HIGH] REGEX_DOS @ line 57: re.compile(p) — the regex pattern is not a constant; if caller-controlled an attacker can supply a catas</td><td></td><td>Yes</td></tr><tr><td><span style="background:#d68910;color:#fff;padding:2px 7px;border-radius:4px;font-size:0.78em;font-weight:bold;">MEDIUM</span></td><td><code>REGEX_DOS</code></td><td><code>keryx/clean_invisible.py:</code></td><td>[AST] 1 finding(s) in clean_invisible.py (70 lines analyzed):
+
+  [1] [HIGH] REGEX_DOS @ line 26: re.compile(&#x27;[&#x27; + &#x27;&#x27;.join(INVISIBLE_CHARS) + &#x27;]&#x27;) — the regex pattern is n</td><td></td><td>Yes</td></tr><tr><td><span style="background:#d68910;color:#fff;padding:2px 7px;border-radius:4px;font-size:0.78em;font-weight:bold;">MEDIUM</span></td><td><code>REGEX_DOS</code></td><td><code>keryx/update_models_2026.py:</code></td><td>[AST] 1 finding(s) in update_models_2026.py (77 lines analyzed):
+
+  [1] [HIGH] REGEX_DOS @ line 41: re.subn(pattern) — the regex pattern is not a constant; if caller-controlled an attacker can supply </td><td></td><td>Yes</td></tr><tr><td><span style="background:#d68910;color:#fff;padding:2px 7px;border-radius:4px;font-size:0.78em;font-weight:bold;">MEDIUM</span></td><td><code>REGEX_DOS</code></td><td><code>keryx/core/rule_learner.py:</code></td><td>[AST] 1 finding(s) in rule_learner.py (229 lines analyzed):
+
+  [1] [HIGH] REGEX_DOS @ line 153: re.compile(pat) — the regex pattern is not a constant; if caller-controlled an attacker can supply a cat</td><td></td><td>Yes</td></tr></tbody>
+  </table>
+</section>
+
+<section>
+  <h2>Top Scored Files (Phase 0)</h2>
+  <table>
+    <thead><tr>
+      <th>File</th><th>Score</th><th>HIGH</th><th>MED</th><th>Rules</th>
+    </tr></thead>
+    <tbody><tr><td><code>keryx/tools/fuzzer.py</code></td><td>100.7</td><td>1</td><td>3</td><td>UNSANITIZED_SUBPROCESS_ARG, REGEX_DOS, SUBPROCESS_EXEC_STARRED</td></tr><tr><td><code>keryx/tools/git_blame.py</code></td><td>84.9</td><td>0</td><td>1</td><td>SUBPROCESS_EXEC_STARRED</td></tr><tr><td><code>keryx/tools/codeql.py</code></td><td>80.6</td><td>0</td><td>5</td><td>SUBPROCESS_EXEC_STARRED, LLM_OUTPUT_SINK</td></tr><tr><td><code>keryx/advisors/cloud_advisor.py</code></td><td>76.9</td><td>1</td><td>1</td><td>REGEX_DOS, LLM_OUTPUT_SINK</td></tr><tr><td><code>keryx/knowledge/embeddings.py</code></td><td>73.8</td><td>0</td><td>5</td><td>OPEN_USER_PATH, LLM_OUTPUT_SINK</td></tr><tr><td><code>keryx/knowledge/graph.py</code></td><td>69.2</td><td>0</td><td>3</td><td>OPEN_USER_PATH, LLM_OUTPUT_SINK</td></tr><tr><td><code>keryx/core/_checkpoint.py</code></td><td>66.7</td><td>0</td><td>3</td><td>OPEN_USER_PATH, LLM_OUTPUT_SINK</td></tr><tr><td><code>keryx/tools/gdb.py</code></td><td>65.3</td><td>0</td><td>1</td><td>SUBPROCESS_EXEC_STARRED</td></tr><tr><td><code>keryx/clean_invisible.py</code></td><td>59.9</td><td>1</td><td>0</td><td>REGEX_DOS</td></tr><tr><td><code>keryx/update_models_2026.py</code></td><td>59.9</td><td>1</td><td>0</td><td>REGEX_DOS</td></tr><tr><td><code>keryx/core/rule_learner.py</code></td><td>57.2</td><td>1</td><td>0</td><td>REGEX_DOS</td></tr></tbody>
+  </table>
+</section>
+
+<section>
+  <h2>Model Cost Breakdown</h2>
+  <table>
+    <thead><tr><th>Model</th><th>Cost</th><th>Calls</th></tr></thead>
+    <tbody><tr><td>haiku</td><td>$0.016115</td><td>18</td></tr><tr><td>opus</td><td>$0.234330</td><td>15</td></tr></tbody>
+  </table>
+</section>
+
+<footer>Keryx Hunter &nbsp;|&nbsp; Rule coverage: R1-R13 &nbsp;|&nbsp;
+  <a href="https://github.com/anthropics/claude-code">claude-code</a></footer>
+</body>
+</html>
