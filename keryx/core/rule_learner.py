@@ -107,7 +107,7 @@ _GAP_PATTERNS: list[tuple[str, str, str, str, str]] = [
     # --- XML / XXE ----------------------------------------------------------
     (
         "XXE_ELEMENTTREE",
-        "LLM_OUTPUT_SINK",   # closest structural family (untrusted deserialization)
+        "UNSAFE_DESERIALIZATION",   # closest structural family (untrusted deserialization)
         r"(?:ET|ElementTree|etree)\.(?:parse|fromstring|XML)\([^\"'][^)]*\)",
         "xml.etree.ElementTree.parse/fromstring with a non-constant argument — "
         "possible XML External Entity (XXE) injection.",

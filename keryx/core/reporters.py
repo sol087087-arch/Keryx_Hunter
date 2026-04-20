@@ -10,7 +10,7 @@ from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from keryx.core.hunt_models import HuntResult, ReportContext, ScanResult
+from keryx.core.hunt_models import HuntResult, ReportContext, ScanResult, routing_score
 
 if TYPE_CHECKING:
     from keryx.models.interface import ModelInterface
@@ -28,7 +28,7 @@ RULE_FIX: dict[str, str] = {
     "HARDCODED_SECRET":           "Move secret to env var or secrets manager; rotate immediately",
     "SUBPROCESS_EXEC_STARRED":    "Expand *args before the call; validate each element",
     "UNSANITIZED_SUBPROCESS_ARG": "Validate/escape arg or use --flag=value; never pass raw user input",
-    "LLM_OUTPUT_SINK":            "Parse LLM output with strict schema (JSON schema / Pydantic); never eval",
+    "UNSAFE_DESERIALIZATION":            "Validate with Pydantic / jsonschema before json.loads(); reject unexpected types",
     "UNSAFE_EVAL_EXEC":           "Replace eval/exec with ast.literal_eval or a safe parser",
     "UNSAFE_PICKLE":              "Replace pickle with json/msgpack; if pickle required, sign payloads with hmac",
     "UNSAFE_YAML_LOAD":           "Use yaml.safe_load() or pass Loader=yaml.SafeLoader explicitly",
@@ -112,8 +112,16 @@ def print_phase0(ctx: ReportContext) -> None:
         print(f"  {'score':>6}  {'H':>3}  {'M':>3}  file")
         print(f"  {'-'*6}  {'-'*3}  {'-'*3}  {'-'*40}")
 
+    # Routing order (by routing_score) determines ★/→ markers; display order
+    # stays sorted by Phase 0 score so the table reads naturally.
+    routing_order = sorted(range(len(results)), key=lambda i: routing_score(results[i]), reverse=True)
+    routing_rank  = [0] * len(results)
+    for rank, idx in enumerate(routing_order):
+        routing_rank[idx] = rank
+
     for i, r in enumerate(results):
-        marker = "★" if i < ctx.escalate_n else ("→" if i < ctx.top_n else " ")
+        rrank  = routing_rank[i]
+        marker = "★" if rrank < ctx.escalate_n else ("→" if rrank < ctx.top_n else " ")
         if ctx.git_enriched:
             blame = r.extra.get("blame", 0.0)
             churn = r.extra.get("churn", 0.0)

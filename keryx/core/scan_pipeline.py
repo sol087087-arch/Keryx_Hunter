@@ -43,9 +43,11 @@ def load_cache(cache_path: Path) -> tuple[dict[str, dict], str | None]:
     try:
         data = json.loads(cache_path.read_text(encoding="utf-8"))
         if data.get("version") != CACHE_VERSION:
+            print(f"[Cache] Version mismatch — discarding cache (expected {CACHE_VERSION})")
             return {}, None
         return data.get("entries", {}), data.get("commit")
-    except Exception:
+    except Exception as exc:
+        print(f"[Cache] WARN: could not load {cache_path}: {exc}")
         return {}, None
 
 
@@ -107,8 +109,8 @@ def git_changed_since(commit: str, repo_root: Path) -> set[str]:
             if len(line) > 3:
                 fname = line[3:].split(" -> ")[-1].strip().strip('"')
                 changed.add(fname)
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[Cache] WARN: git change detection failed ({exc}) — treating all files as changed")
     return changed
 
 

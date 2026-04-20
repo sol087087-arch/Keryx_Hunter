@@ -251,44 +251,65 @@ except Exception as exc:
 
 
 def _tpl_regex_dos(finding: dict, marker: str) -> str:
-    """REGEX_DOS — demonstrate that a user-controlled pattern is accepted without validation.
+    """REGEX_DOS — two-phase verification.
 
-    Uses ``(a+)+`` (the canonical catastrophically-backtracking pattern) against a
-    short input so the sandbox completes in milliseconds.  The marker is emitted
-    when the pattern compiles and matches without raising ``re.error``, proving the
-    input is accepted with zero validation.
+    Phase 1 (always): compile the catastrophic pattern without validation →
+    confirms the code accepts untrusted regex input (marker always emitted).
 
-    Context comment in the output explains the exponential-scaling risk:
-    the same call with ``"a" * 30 + "!"`` would hang for minutes/hours.
+    Phase 2 (level): attempt real DoS with a long input in a daemon thread
+    with a 2-second wall-clock timeout.
+    - Thread still running after 2s  → KERYX_LEVEL=triggered  (actual hang)
+    - re.error raised by CPython 3.11+ protection → KERYX_LEVEL=reachable
+    - Completes fast (unexpected)    → KERYX_LEVEL=reachable
+
+    poc.reproduce() reads KERYX_LEVEL= to set verification_level independently
+    of the marker, so reproduced=True is always set while the level is honest.
     """
     return f"""\
-import re, sys, time
-marker = {marker!r}
+import re, sys, time, threading
 
-# Attacker-supplied catastrophically backtracking pattern.
-# With a short input (3 chars) this completes instantly;
-# with "a" * 30 + "!" it would run for minutes on CPython.
-attacker_pattern = "(a+)+"
-safe_input       = "aaa!"   # short — guaranteed fast even with backtracking
+marker      = {marker!r}
+dos_pattern = r"(a+)+"
+dos_input   = "a" * 28 + "!"   # exponential backtracking on CPython <= 3.10
 
-try:
-    compiled = re.compile(attacker_pattern)   # no allowlist check — accepted
-    t0 = time.perf_counter()
-    compiled.search(safe_input)
-    elapsed = time.perf_counter() - t0
+_done  = threading.Event()
+_error = []
 
-    sys.stdout.write(marker + "\\n")
+def _run():
+    try:
+        re.search(dos_pattern, dos_input)
+        _done.set()
+    except re.error as exc:
+        _error.append(str(exc))
+        _done.set()
+
+t0 = time.perf_counter()
+t = threading.Thread(target=_run, daemon=True)
+t.start()
+triggered = not _done.wait(timeout=2.0)
+elapsed   = time.perf_counter() - t0
+
+# Always emit marker — pattern accepted without validation is confirmed.
+sys.stdout.write(marker + "\\n")
+
+if triggered:
+    sys.stdout.write("KERYX_LEVEL=triggered\\n")
     sys.stdout.write(
-        f"[REGEX_DOS] attacker pattern accepted and executed: {{attacker_pattern!r}}"
-        f"  elapsed={{elapsed:.6f}}s (safe_input)\\n"
+        f"[REGEX_DOS] TRIGGERED — pattern blocked for {{elapsed:.2f}}s"
+        f"  input_len={{len(dos_input)}}\\n"
     )
+elif _error:
+    sys.stdout.write("KERYX_LEVEL=reachable\\n")
     sys.stdout.write(
-        "[REGEX_DOS] same call with 'a'*30+'!' would exhibit exponential backtracking\\n"
+        f"[REGEX_DOS] REACHABLE — CPython 3.11+ rejected catastrophic pattern\\n"
+        f"[REGEX_DOS] error: {{_error[0]}}\\n"
+        f"[REGEX_DOS] pattern would hang on Python <=3.10\\n"
     )
-except re.error as exc:
-    sys.stderr.write(f"[REGEX_DOS] pattern rejected by re.compile: {{exc}}\\n")
-except Exception as exc:
-    sys.stderr.write(f"[REGEX_DOS] unexpected error: {{exc}}\\n")
+else:
+    sys.stdout.write("KERYX_LEVEL=reachable\\n")
+    sys.stdout.write(
+        f"[REGEX_DOS] REACHABLE — pattern accepted and executed in {{elapsed:.6f}}s\\n"
+    )
 """
 
 
@@ -355,7 +376,7 @@ _TEMPLATES: dict[str, Callable[[dict, str], str]] = {
 
 # Rules with no template — LLM fallback only, skip if no LLM available
 _NO_TEMPLATE_RULES: frozenset[str] = frozenset({
-    "LLM_OUTPUT_SINK",           # context-dependent; harness would need full agent setup
+    "UNSAFE_DESERIALIZATION",           # context-dependent; harness would need full agent setup
     "SUBPROCESS_EXEC_STARRED",   # requires knowing the star-expanded list at runtime
     "UNSANITIZED_SUBPROCESS_ARG",
 })

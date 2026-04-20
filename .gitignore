@@ -1,3 +1,5 @@
+SESSION_REPORT.md
+NEXT_SESSION_PLAN.md
 **/*.bak
 **/*.pyc.env
 .coverage

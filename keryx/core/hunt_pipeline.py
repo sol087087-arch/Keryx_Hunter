@@ -17,7 +17,7 @@ from keryx.advisors.base import RuleBasedAdvisor
 from keryx.advisors.manager import create_advisor_manager
 from keryx.core.agent import KeryxAgent
 from keryx.core.hunt_models import HuntResult, ScanResult
-from keryx.models.interface import ModelInterface
+from keryx.models.interface import BudgetExceededError, ModelInterface
 from keryx.models.scripted import ScriptedModel
 from keryx.tools.Toolbox import create_default_toolbox
 
@@ -110,9 +110,22 @@ async def hunt_file(
         max_clean_scans_before_exit=1,
     )
 
-    t0     = time.perf_counter()
-    result = await agent.run(target_path=str(scan.file), resume=False,
-                             context_hint=context_hint)
+    t0 = time.perf_counter()
+    try:
+        result = await agent.run(target_path=str(scan.file), resume=False,
+                                 context_hint=context_hint)
+    except BudgetExceededError as exc:
+        print(f"[Budget] Stopped {_rel(scan.file, repo_root)}: {exc}")
+        return HuntResult(
+            file        = scan.file,
+            scan        = scan,
+            steps       = agent.context.steps_taken if agent._shared_context else 0,
+            confirmed   = agent.context.confirmed_vulns if agent._shared_context else [],
+            elapsed_s   = time.perf_counter() - t0,
+            status      = "budget_exceeded",
+            model_label = model_label,
+            escalated   = escalated,
+        )
     return HuntResult(
         file        = scan.file,
         scan        = scan,

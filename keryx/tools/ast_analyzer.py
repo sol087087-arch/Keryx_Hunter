@@ -54,12 +54,49 @@ class Finding:
 # AST visitor
 # ---------------------------------------------------------------------------
 
+def _is_re_escape_call(node: ast.expr) -> bool:
+    """Return True if *node* is a call to re.escape(...) or re.escape(...)."""
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    # re.escape(x)
+    if (
+        isinstance(func, ast.Attribute)
+        and func.attr == "escape"
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "re"
+    ):
+        return True
+    return False
+
+
+def _fstring_all_caps_names(node: ast.expr) -> bool:
+    """Return True if *node* is an f-string whose only non-literal parts are
+    ALL_CAPS Name references (module-level constants by Python convention).
+
+    e.g. f"^{PREFIX}{EVENT}.*" — both PREFIX and EVENT are constants → safe.
+    """
+    if not isinstance(node, ast.JoinedStr):
+        return False
+    for value in node.values:
+        if isinstance(value, ast.Constant):
+            continue  # literal text part
+        if isinstance(value, ast.FormattedValue):
+            inner = value.value
+            if isinstance(inner, ast.Name) and inner.id.isupper():
+                continue  # ALL_CAPS name — treat as constant
+            return False
+        return False
+    return True
+
+
 class _VulnVisitor(ast.NodeVisitor):
     """Single-pass AST visitor collecting security findings."""
 
-    def __init__(self, source_lines: list[str]) -> None:
+    def __init__(self, source_lines: list[str], file_path: str = "") -> None:
         self.findings: list[Finding] = []
         self._lines = source_lines
+        self._file_path = file_path.lower()
         # Parameter tracking — updated by visit_FunctionDef/visit_AsyncFunctionDef.
         self._param_names: set[str] = set()
         self._param_stack: list[set[str]] = []
@@ -74,6 +111,8 @@ class _VulnVisitor(ast.NodeVisitor):
         self._name_to_module: dict[str, str] = {}
         self._ssti_aliases:   set[str]       = set()
         self._module_aliases: dict[str, str] = {}
+        # Names known to hold re.escape()-d values — populated by visit_Assign.
+        self._re_escaped_names: set[str] = set()
 
     # ------------------------------------------------------------------
     # Helpers
@@ -324,6 +363,43 @@ class _VulnVisitor(ast.NodeVisitor):
 
     _SECRET_KEYWORDS = ("password", "passwd", "secret", "api_key", "apikey", "token", "private_key")
 
+    # Directory names (path components) that indicate test/fixture code.
+    _TEST_DIR_NAMES = frozenset({
+        "tests", "test", "mocks", "mock", "fixtures", "fixture",
+        "examples", "example", "samples", "sample", "demos", "demo",
+        "stubs", "stub", "fakes", "fake",
+    })
+
+    # Value prefixes/substrings that look like test credentials, not real secrets.
+    _PLACEHOLDER_PATTERNS = (
+        "dummy", "placeholder", "changeme", "example", "sample",
+        "your_", "insert_", "replace_", "todo", "fixme",
+        "xxxxxxxxx", "aaaaaa", "123456",
+    )
+
+    def _is_test_context(self, val: str) -> bool:
+        """Return True if the file path looks like test/fixture code.
+
+        Checks:
+        - Any path component (directory name) matches a known test dir name
+        - File basename starts with "test_" or ends with "_test.py"
+        """
+        import os
+        parts = self._file_path.replace("\\", "/").split("/")
+        basename = parts[-1] if parts else ""
+        # File name heuristics
+        if basename.startswith("test_") or basename.endswith("_test.py"):
+            return True
+        if basename == "conftest.py":
+            return True
+        # Directory component heuristics
+        return any(p in self._TEST_DIR_NAMES for p in parts[:-1])
+
+    def _is_placeholder_value(self, val: str) -> bool:
+        """Return True if the value looks like a test/placeholder credential."""
+        v = val.lower()
+        return any(p in v for p in self._PLACEHOLDER_PATTERNS)
+
     def _check_hardcoded_secret(self, node: ast.Assign) -> None:
         for target in node.targets:
             if not isinstance(target, ast.Name):
@@ -333,12 +409,17 @@ class _VulnVisitor(ast.NodeVisitor):
                 continue
             if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
                 val = node.value.value
-                if len(val) > 4:   # skip empty/placeholder
-                    self._add(
-                        "HARDCODED_SECRET", "HIGH", node,
-                        f'"{target.id}" assigned a hardcoded string value — '
-                        f"credentials should come from environment variables.",
-                    )
+                if len(val) <= 4:
+                    continue  # empty / trivially short
+                if self._is_test_context(val):
+                    continue  # test/fixture file — downgrade to noise
+                if self._is_placeholder_value(val):
+                    continue  # obvious placeholder value
+                self._add(
+                    "HARDCODED_SECRET", "HIGH", node,
+                    f'"{target.id}" assigned a hardcoded string value — '
+                    f"credentials should come from environment variables.",
+                )
 
     # ------------------------------------------------------------------
     # R5 — asyncio.create_subprocess_exec without "--" in cmd
@@ -361,14 +442,20 @@ class _VulnVisitor(ast.NodeVisitor):
                 )
 
     # ------------------------------------------------------------------
-    # R6 — json.loads() / json.load() on a non-literal (LLM output sink)
+    # R6 — json.loads() / json.load() on externally-sourced input
     # ------------------------------------------------------------------
 
-    def _check_llm_output_sink(self, node: ast.Call) -> None:
-        """
-        Flags json.loads(x) / json.load(x) where x is not a string literal.
-        These are deserialization sinks that may process LLM output or other
-        external input without schema validation.
+    def _check_unsafe_deserialization(self, node: ast.Call) -> None:
+        """Flags json.loads/json.load where the argument is clearly external input.
+
+        Fires when the first argument is:
+          - A function parameter (caller-controlled)
+          - An attribute access (request.body, response.text, obj.data, …)
+          - A call expression (request.read(), recv(), input(), …)
+
+        Skips local variables that are NOT function parameters — those are almost
+        always assigned from internal sources and produce excessive noise.
+        Skips string / bytes literals (always safe).
         """
         func = node.func
         if not (
@@ -382,12 +469,17 @@ class _VulnVisitor(ast.NodeVisitor):
             return
         first_arg = node.args[0]
         if isinstance(first_arg, ast.Constant):
-            return  # literal string — safe
+            return  # literal — safe
+        # Plain local variable that is NOT a known function parameter → skip
+        if isinstance(first_arg, ast.Name) and first_arg.id not in self._param_names:
+            return
         arg_repr = getattr(first_arg, "id", None) or ast.unparse(first_arg)
         self._add(
-            "LLM_OUTPUT_SINK", "MEDIUM", node,
-            f"json.{func.attr}({arg_repr}) — deserializes a non-literal value; "
-            "if the source is LLM output or external input, validate schema before parsing.",
+            "UNSAFE_DESERIALIZATION", "MEDIUM", node,
+            f"json.{func.attr}({arg_repr}) — deserializes external input without "
+            "schema validation; an attacker can supply unexpected types or deeply "
+            "nested structures. Validate with a strict schema (Pydantic / jsonschema) "
+            "before deserializing.",
             vuln_arg=first_arg,
         )
 
@@ -570,8 +662,12 @@ class _VulnVisitor(ast.NodeVisitor):
 
     # Known template engines that support code-execution expressions (e.g. {{7*7}})
     _SSTI_MODULES = {"jinja2", "mako", "chameleon", "django.template"}
-    # from_string() callers that are genuine template environments
+    # from_string() callers that are genuine template environments.
+    # Matched against the bare Name id OR any substring of ast.unparse(receiver).
     _SSTI_ENV_NAMES = {"env", "environment", "jinja_env", "jinja2_env", "template_env"}
+    # Attribute-access patterns: if the unparse of the receiver ends with one of
+    # these suffixes it is treated as a template environment (e.g. self.env, self._env).
+    _SSTI_ENV_SUFFIXES = (".env", "._env", ".environment", ".jinja_env", ".jinja2_env")
 
     def _check_template_injection(self, node: ast.Call) -> None:
         """Detect Server-Side Template Injection (SSTI) sources.
@@ -659,6 +755,7 @@ class _VulnVisitor(ast.NodeVisitor):
             is_known_env = (
                 any(engine in env_repr for engine in self._SSTI_MODULES)
                 or env_name.lower() in self._SSTI_ENV_NAMES
+                or any(env_repr.endswith(sfx) for sfx in self._SSTI_ENV_SUFFIXES)
             )
             if is_known_env:
                 self._add(
@@ -703,6 +800,12 @@ class _VulnVisitor(ast.NodeVisitor):
         pattern_arg = node.args[0]
         if isinstance(pattern_arg, ast.Constant):
             return  # hardcoded pattern — safe
+        if _is_re_escape_call(pattern_arg):
+            return  # inline re.escape(x) — sanitized
+        if isinstance(pattern_arg, ast.Name) and pattern_arg.id in self._re_escaped_names:
+            return  # pre-assigned from re.escape() — sanitized
+        if _fstring_all_caps_names(pattern_arg):
+            return  # f-string built from module-level constants (ALL_CAPS) — safe
         arg_repr = getattr(pattern_arg, "id", None) or ast.unparse(pattern_arg)
         self._add(
             "REGEX_DOS", "HIGH", node,
@@ -766,7 +869,7 @@ class _VulnVisitor(ast.NodeVisitor):
         self._check_missing_dashdash(node)
         self._check_open(node)
         self._check_create_subprocess_exec(node)
-        self._check_llm_output_sink(node)
+        self._check_unsafe_deserialization(node)
         self._check_eval_exec(node)
         self._check_unsafe_pickle(node)
         self._check_unsafe_yaml(node)
@@ -778,6 +881,11 @@ class _VulnVisitor(ast.NodeVisitor):
 
     def visit_Assign(self, node: ast.Assign) -> None:
         self._check_hardcoded_secret(node)
+        # Track `name = re.escape(x)` so _check_regex_dos can skip it.
+        if _is_re_escape_call(node.value):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    self._re_escaped_names.add(target.id)
         self.generic_visit(node)
 
 
@@ -853,7 +961,7 @@ class ASTAnalyzerTool(BaseTool):
             )
 
         source_lines = source.splitlines()
-        visitor = _VulnVisitor(source_lines)
+        visitor = _VulnVisitor(source_lines, file_path=str(path))
         visitor.visit(tree)
         findings = visitor.findings
 

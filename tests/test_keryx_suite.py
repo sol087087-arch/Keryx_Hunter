@@ -9567,17 +9567,17 @@ proc = asyncio.create_subprocess_exec(*cmd)
         assert isinstance(t, ASTAnalyzerTool)
         assert t.name == "codeql_query"
 
-    # ── R6 LLM_OUTPUT_SINK ────────────────────────────────────────────────
+    # ── R6 UNSAFE_DESERIALIZATION ────────────────────────────────────────────────
 
     @pytest.mark.asyncio
     async def test_r6_json_loads_variable_flagged(self, tool, tmp_path) -> None:
-        """json.loads(variable) — non-literal arg triggers LLM_OUTPUT_SINK."""
-        src = "import json\nresult = json.loads(raw_text)\n"
+        """json.loads(param) — function parameter triggers UNSAFE_DESERIALIZATION."""
+        src = "import json\ndef handle(raw_text):\n    return json.loads(raw_text)\n"
         f = self._write(tmp_path, "r6a.py", src)
         result = await tool.execute({"path": str(f)})
         assert result.success
         rules = [fd["rule"] for fd in result.data["findings"]]
-        assert "LLM_OUTPUT_SINK" in rules
+        assert "UNSAFE_DESERIALIZATION" in rules
 
     @pytest.mark.asyncio
     async def test_r6_json_loads_literal_not_flagged(self, tool, tmp_path) -> None:
@@ -9587,7 +9587,7 @@ proc = asyncio.create_subprocess_exec(*cmd)
         result = await tool.execute({"path": str(f)})
         assert result.success
         rules = [fd["rule"] for fd in result.data["findings"]]
-        assert "LLM_OUTPUT_SINK" not in rules
+        assert "UNSAFE_DESERIALIZATION" not in rules
 
     @pytest.mark.asyncio
     async def test_r6_json_load_call_expr_flagged(self, tool, tmp_path) -> None:
@@ -9597,16 +9597,16 @@ proc = asyncio.create_subprocess_exec(*cmd)
         result = await tool.execute({"path": str(f)})
         assert result.success
         rules = [fd["rule"] for fd in result.data["findings"]]
-        assert "LLM_OUTPUT_SINK" in rules
+        assert "UNSAFE_DESERIALIZATION" in rules
 
     @pytest.mark.asyncio
     async def test_r6_severity_is_medium(self, tool, tmp_path) -> None:
-        """LLM_OUTPUT_SINK is MEDIUM severity (exploitability requires specific context)."""
-        src = "import json\nresult = json.loads(raw)\n"
+        """UNSAFE_DESERIALIZATION is MEDIUM severity (exploitability requires specific context)."""
+        src = "import json\ndef parse(raw):\n    return json.loads(raw)\n"
         f = self._write(tmp_path, "r6d.py", src)
         result = await tool.execute({"path": str(f)})
         assert result.success
-        sinks = [fd for fd in result.data["findings"] if fd["rule"] == "LLM_OUTPUT_SINK"]
+        sinks = [fd for fd in result.data["findings"] if fd["rule"] == "UNSAFE_DESERIALIZATION"]
         assert sinks
         assert sinks[0]["severity"] == "MEDIUM"
 
@@ -9619,7 +9619,27 @@ proc = asyncio.create_subprocess_exec(*cmd)
         result = await tool.execute({"path": str(f)})
         assert result.success
         rules = [fd["rule"] for fd in result.data["findings"]]
-        assert "LLM_OUTPUT_SINK" not in rules
+        assert "UNSAFE_DESERIALIZATION" not in rules
+
+    @pytest.mark.asyncio
+    async def test_r6_local_var_not_flagged(self, tool, tmp_path) -> None:
+        """json.loads(local_var) where local_var is not a param — no finding (noise reduction)."""
+        src = "import json\ntext = get_data()\nresult = json.loads(text)\n"
+        f = self._write(tmp_path, "r6f.py", src)
+        result = await tool.execute({"path": str(f)})
+        assert result.success
+        rules = [fd["rule"] for fd in result.data["findings"]]
+        assert "UNSAFE_DESERIALIZATION" not in rules
+
+    @pytest.mark.asyncio
+    async def test_r6_attribute_access_flagged(self, tool, tmp_path) -> None:
+        """json.loads(request.body) — attribute access flags even without param tracking."""
+        src = "import json\ndata = json.loads(request.body)\n"
+        f = self._write(tmp_path, "r6g.py", src)
+        result = await tool.execute({"path": str(f)})
+        assert result.success
+        rules = [fd["rule"] for fd in result.data["findings"]]
+        assert "UNSAFE_DESERIALIZATION" in rules
 
     # ── R7: UNSAFE_EVAL_EXEC ───────────────────────────────────────────────
 
@@ -10675,7 +10695,7 @@ class TestFuzzingHarness:
 
     def test_no_template_rule_returns_none_without_llm(self) -> None:
         from keryx.fuzzing.harness import generate
-        result = generate({"rule": "LLM_OUTPUT_SINK"}, "MARKER")
+        result = generate({"rule": "UNSAFE_DESERIALIZATION"}, "MARKER")
         assert result is None
 
     def test_no_template_rule_calls_llm_fallback(self) -> None:
@@ -10686,7 +10706,7 @@ class TestFuzzingHarness:
             called_with["marker"]  = marker
             return f"# llm harness for {marker}"
 
-        script = generate({"rule": "LLM_OUTPUT_SINK"}, "MYMARKER", llm_generate_fn=fake_llm)
+        script = generate({"rule": "UNSAFE_DESERIALIZATION"}, "MYMARKER", llm_generate_fn=fake_llm)
         assert script == "# llm harness for MYMARKER"
         assert called_with["marker"] == "MYMARKER"
 
@@ -10829,7 +10849,7 @@ class TestFuzzingPoC:
 
     def test_no_harness_returns_error(self) -> None:
         from keryx.fuzzing.poc import reproduce
-        poc = reproduce({"rule": "LLM_OUTPUT_SINK"}, timeout=5)
+        poc = reproduce({"rule": "UNSAFE_DESERIALIZATION"}, timeout=5)
         assert poc.reproduced is False
         assert poc.error is not None
         assert poc.confidence_boost == 0.0
@@ -10847,7 +10867,7 @@ class TestFuzzingPoC:
             called["marker"] = marker
             return f"import sys; sys.stdout.write({marker!r} + '\\n')"
 
-        poc = reproduce({"rule": "LLM_OUTPUT_SINK"}, timeout=5, llm_generate_fn=fake_llm)
+        poc = reproduce({"rule": "UNSAFE_DESERIALIZATION"}, timeout=5, llm_generate_fn=fake_llm)
         assert poc.reproduced is True
         assert "marker" in called
 
@@ -10868,7 +10888,7 @@ class TestFuzzingTool:
     async def test_execute_no_template(self) -> None:
         from keryx.fuzzing.tool import create_fuzzer_tool
         tool = create_fuzzer_tool(sandbox_timeout=5)
-        result = await tool.execute({"finding": {"rule": "LLM_OUTPUT_SINK"}})
+        result = await tool.execute({"finding": {"rule": "UNSAFE_DESERIALIZATION"}})
         assert result.success  # tool itself succeeds
         assert result.data["reproduced"] is False
         assert result.data["error"] is not None
@@ -11935,7 +11955,7 @@ class TestLLMHarnessFactory:
         marker = "KERYX_POC_LLMTEST"
         script = f'import sys\nsys.stdout.write({marker!r} + "\\n")'
         fn = make_llm_generate_fn(self._fake_model(script))
-        result = fn({"rule": "LLM_OUTPUT_SINK"}, marker)
+        result = fn({"rule": "UNSAFE_DESERIALIZATION"}, marker)
         assert result is not None
         assert marker in result
 
@@ -11945,7 +11965,7 @@ class TestLLMHarnessFactory:
         inner = f'import sys\nsys.stdout.write({marker!r} + "\\n")'
         fenced = f"```python\n{inner}\n```"
         fn = make_llm_generate_fn(self._fake_model(fenced))
-        result = fn({"rule": "LLM_OUTPUT_SINK"}, marker)
+        result = fn({"rule": "UNSAFE_DESERIALIZATION"}, marker)
         assert result is not None
         assert "```" not in result
         assert marker in result
@@ -11953,14 +11973,14 @@ class TestLLMHarnessFactory:
     def test_missing_marker_returns_none(self) -> None:
         from keryx.fuzzing.llm_harness import make_llm_generate_fn
         fn = make_llm_generate_fn(self._fake_model("print('no marker here')"))
-        result = fn({"rule": "LLM_OUTPUT_SINK"}, "KERYX_POC_NOTHERE")
+        result = fn({"rule": "UNSAFE_DESERIALIZATION"}, "KERYX_POC_NOTHERE")
         assert result is None
 
     def test_invalid_python_returns_none(self) -> None:
         from keryx.fuzzing.llm_harness import make_llm_generate_fn
         marker = "KERYX_POC_BADPY"
         fn = make_llm_generate_fn(self._fake_model(f"def bad syntax({marker!r}):"))
-        result = fn({"rule": "LLM_OUTPUT_SINK"}, marker)
+        result = fn({"rule": "UNSAFE_DESERIALIZATION"}, marker)
         assert result is None
 
     def test_model_exception_returns_none(self) -> None:
@@ -11992,7 +12012,7 @@ class TestLLMHarnessFactory:
                     requires_gpu=False, is_local=True, is_quantized=False)
             def unload(self): pass
         fn = make_llm_generate_fn(_Raiser())
-        result = fn({"rule": "LLM_OUTPUT_SINK"}, "KERYX_POC_RAISE")
+        result = fn({"rule": "UNSAFE_DESERIALIZATION"}, "KERYX_POC_RAISE")
         assert result is None
 
     def test_plain_fences_stripped(self) -> None:
@@ -12016,9 +12036,9 @@ class TestLLMHarnessFactory:
             return f'import sys\nsys.stdout.write({marker!r} + "\\n")'
         fn = make_llm_generate_fn(self._fake_model(""))  # model unused; capture_fn overrides
         # Use capture_fn directly as llm_generate_fn
-        poc = reproduce({"rule": "LLM_OUTPUT_SINK"}, timeout=5, llm_generate_fn=capture_fn)
+        poc = reproduce({"rule": "UNSAFE_DESERIALIZATION"}, timeout=5, llm_generate_fn=capture_fn)
         assert poc.reproduced is True
-        assert poc.rule == "LLM_OUTPUT_SINK"
+        assert poc.rule == "UNSAFE_DESERIALIZATION"
 
 
 # ===========================================================================
@@ -12382,11 +12402,11 @@ class TestHtmlReport:
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "report.html"
             scan = ScanResult(file=Path("keryx/tools/ast_analyzer.py"),
-                              high_count=1, rules=["LLM_OUTPUT_SINK"])
+                              high_count=1, rules=["UNSAFE_DESERIALIZATION"])
             hunt = HuntResult(
                 file=Path("keryx/tools/ast_analyzer.py"),
                 scan=scan, steps=3, elapsed_s=1.0, model_label="haiku",
-                confirmed=[{"rule": "LLM_OUTPUT_SINK", "severity": "HIGH",
+                confirmed=[{"rule": "UNSAFE_DESERIALIZATION", "severity": "HIGH",
                             "message": "<script>alert(1)</script>"}],
                 status="confirmed",
             )

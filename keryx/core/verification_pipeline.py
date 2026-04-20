@@ -54,8 +54,8 @@ class VerificationPipeline:
                 return tool
 
         print(
-            f"[WARN] target_tool not resolved for {stem!r} — "
-            "skipping dynamic verification"
+            f"[INFO] {stem!r} has no registered tool — "
+            "falling back to fuzzer PoC verification"
         )
         return None
 

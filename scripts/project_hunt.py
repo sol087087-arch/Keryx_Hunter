@@ -63,6 +63,7 @@ import time
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).parent.parent
+_last_ctx = None  # set by main() for test introspection
 sys.path.insert(0, str(_REPO_ROOT))
 
 from keryx.core.hunt_models import (
@@ -78,6 +79,7 @@ from keryx.core.reporters import (
     write_output_json,
     write_output_sarif,
 )
+from keryx.models.interface import BudgetExceededError
 from keryx.core.hunt_pipeline import (
     STEPS_DEFAULT, STEPS_ESCALATE,
     build_model,
@@ -219,28 +221,39 @@ async def main(args: argparse.Namespace) -> None:
     t0 = time.perf_counter()
 
     # ── Phase 1a ──────────────────────────────────────────────────────────
-    heavy_hunts = await run_escalate_tier(
-        heavy_targets,
-        ctx.models.get(args.escalate_model) or
-        build_model(args.escalate_model, args.budget, _REPO_ROOT, scripted=args.scripted),
-        args.escalate_model, args.mode, _REPO_ROOT,
-    )
+    try:
+        heavy_hunts = await run_escalate_tier(
+            heavy_targets,
+            ctx.models.get(args.escalate_model) or
+            build_model(args.escalate_model, args.budget, _REPO_ROOT, scripted=args.scripted),
+            args.escalate_model, args.mode, _REPO_ROOT,
+        )
+    except BudgetExceededError as exc:
+        print(f"\n[Budget] Phase 1a stopped early: {exc}")
+        heavy_hunts = []
 
     # ── Phase 1b ──────────────────────────────────────────────────────────
-    default_hunts = await run_default_tier(
-        default_targets,
-        ctx.models.get(args.default_model) or
-        build_model(args.default_model, args.budget, _REPO_ROOT, scripted=args.scripted),
-        args.default_model, args.mode, _REPO_ROOT,
-    )
+    try:
+        default_hunts = await run_default_tier(
+            default_targets,
+            ctx.models.get(args.default_model) or
+            build_model(args.default_model, args.budget, _REPO_ROOT, scripted=args.scripted),
+            args.default_model, args.mode, _REPO_ROOT,
+        )
+    except BudgetExceededError as exc:
+        print(f"\n[Budget] Phase 1b stopped early: {exc}")
+        default_hunts = []
 
     # ── Phase 1c ──────────────────────────────────────────────────────────
     esc_hunts: list[HuntResult] = []
     if can_escalate and args.escalate_inconclusive:
-        esc_hunts = await run_escalation_phase(
-            default_hunts, ctx.models, args.budget, args.scripted,
-            args.mode, args.escalate_model, args.default_model, _REPO_ROOT,
-        )
+        try:
+            esc_hunts = await run_escalation_phase(
+                default_hunts, ctx.models, args.budget, args.scripted,
+                args.mode, args.escalate_model, args.default_model, _REPO_ROOT,
+            )
+        except BudgetExceededError as exc:
+            print(f"\n[Budget] Phase 1c stopped early: {exc}")
 
     ctx.total_elapsed_s = time.perf_counter() - t0
     ctx.hunts = heavy_hunts + default_hunts + esc_hunts
@@ -280,6 +293,9 @@ async def main(args: argparse.Namespace) -> None:
         from keryx.core.rule_learner import RuleLearner, print_suggestions
         learner = RuleLearner([r.file for r in all_results])
         print_suggestions(learner.analyse())
+
+    global _last_ctx
+    _last_ctx = ctx
 
     if args.fail_if_confirmed:
         all_confirmed = [v for h in ctx.hunts for v in h.confirmed]

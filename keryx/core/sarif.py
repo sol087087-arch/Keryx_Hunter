@@ -62,7 +62,7 @@ _RULE_META: dict[str, tuple[str, str, str]] = {
         "Unsanitised user-controlled argument appended to a subprocess command.",
         "Validate/escape arg or use --flag=value; never pass raw user input.",
     ),
-    "LLM_OUTPUT_SINK": (
+    "UNSAFE_DESERIALIZATION": (
         "LlmOutputSink",
         "json.loads() / json.load() deserialises a non-literal value (possible LLM output sink).",
         "Validate with strict JSON schema / Pydantic before parsing; never eval.",

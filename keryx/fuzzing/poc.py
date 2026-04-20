@@ -59,7 +59,18 @@ def reproduce(
     combined   = result.stdout + result.stderr
     reproduced = marker in combined
 
-    if reproduced:
+    # Harness may self-report level via KERYX_LEVEL=<value> in stdout/stderr.
+    # This lets rules like REGEX_DOS set an honest level (triggered/reachable)
+    # while still emitting the marker so reproduced=True.
+    keryx_level: str | None = None
+    for line in combined.splitlines():
+        if line.startswith("KERYX_LEVEL="):
+            keryx_level = line.split("=", 1)[1].strip()
+            break
+
+    if keryx_level in ("exploited", "triggered", "reachable"):
+        level = keryx_level
+    elif reproduced:
         level = "exploited"
     elif result.timed_out or (result.exit_code is not None and result.exit_code != 0):
         level = "triggered"

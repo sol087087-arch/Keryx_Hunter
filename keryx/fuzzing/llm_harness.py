@@ -3,7 +3,7 @@
 
 Provides ``make_llm_generate_fn(model)`` which returns a callable compatible
 with ``harness.generate(..., llm_generate_fn=fn)``.  Used as a fallback when
-no static template exists for a rule (e.g. LLM_OUTPUT_SINK) or when the user
+no static template exists for a rule (e.g. UNSAFE_DESERIALIZATION) or when the user
 passes ``--fuzz-llm`` to request AI-generated harnesses for every finding.
 
 The generated script must:

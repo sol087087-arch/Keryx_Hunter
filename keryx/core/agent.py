@@ -107,6 +107,9 @@ class KeryxAgent:
         self._consecutive_low_confidence:   int = 0   # low-conf streak
         self._codeql_unconfirmed:           bool = False  # AST found HIGH but not confirmed
         self._codeql_high_observation:      str  = ""     # observation snapshot from triggering step
+        # Set to True when critique explicitly declares the codeql HIGH finding a
+        # false positive.  Blocks the flexible static fallback from confirming it.
+        self._codeql_high_rejected:         bool = False
         # Early-exit: break after this many consecutive clean codeql scans (no HIGH findings).
         # 1 = exit on first clean scan (fast mode); set higher to let agent probe more paths.
         self._consecutive_clean_scans:      int  = 0
@@ -114,6 +117,13 @@ class KeryxAgent:
         # One-shot hint from a previous model pass (Phase 1c escalation).
         # Injected into the first prompt only; cleared after that step.
         self._initial_hint: str | None = None
+        # Flexible mode: track whether the agent has read the file source at least
+        # once.  The 2-step verification window does NOT start until this is True,
+        # so the LLM always sees the code before confirming.
+        self._file_read_done: bool = False
+        # Snapshot of the codeql HIGH observation before read_file has been called.
+        # Cleared and promoted to _codeql_high_found_step once read_file completes.
+        self._pending_high_observation: str = ""
 
     # ------------------------------------------------------------------
     # Context property
@@ -329,17 +339,36 @@ class KeryxAgent:
     async def _self_critique_async(self, hypothesis: str = "", observation: str = "") -> str:
         hyp_line = f"Hypothesis under review: {hypothesis}\n" if hypothesis else ""
         obs_line = f"Evidence gathered:\n{observation[:6000]}\n\n" if observation else ""
+        target   = self.context.target_path
+        import os as _os
+        basename = _os.path.basename(target)
+        is_test  = (
+            basename.startswith("test_")
+            or basename.endswith("_test.py")
+            or "/test" in target.replace("\\", "/")
+            or "/mock" in target.replace("\\", "/")
+        )
+        test_note = (
+            f"NOTE: The file being analyzed ({basename}) is a TEST FILE. "
+            "Findings in test/fixture code are usually false positives — "
+            "test files exist in a controlled environment and are not attack surfaces.\n\n"
+            if is_test else ""
+        )
         prompt = (
             "You are reviewing a specific vulnerability hypothesis about analyzed source code.\n"
             "The 'read_file' / 'git_blame' calls are just tools for gathering evidence — "
             "do NOT judge those as vulnerabilities themselves.\n\n"
+            f"{test_note}"
+            f"Target file: {target}\n"
             f"{hyp_line}"
             f"{obs_line}"
             "Answer concisely:\n"
             "1. Does the evidence actually support this hypothesis? (YES / PARTIALLY / NO)\n"
-            "2. Is the vulnerable code path reachable in normal operation?\n"
+            "2. Is the vulnerable code path reachable from untrusted external input "
+            "(NOT in test/fixture/mock code)?\n"
             "3. Your verdict: 'GENUINE CONCERN', 'NEEDS MORE EVIDENCE', or "
-            "'THIS IS A FALSE POSITIVE' (only if the code clearly does not have this issue).\n"
+            "'THIS IS A FALSE POSITIVE' (use this if the code is test-only, "
+            "the value is a placeholder, or the path is clearly not reachable from user input).\n"
         )
         loop = asyncio.get_running_loop()
         try:
@@ -378,6 +407,12 @@ class KeryxAgent:
             self.context.blacklist_hypothesis(hyp)
             print("[Critique] Hypothesis blacklisted as false positive")
             action.confidence *= 0.3
+            # If we're inside or right at the codeql HIGH verification window,
+            # mark the finding itself as critique-rejected so the static fallback
+            # does not confirm it.
+            if self._codeql_high_found_step >= 0 or self._pending_high_observation:
+                self._codeql_high_rejected = True
+                print("[Critique] codeql HIGH marked as critique-rejected — will not auto-confirm")
 
         elif "needs more evidence" in critique_lower or "insufficient" in critique_lower:
             self.context.request_additional_evidence(action.action)
@@ -411,6 +446,22 @@ class KeryxAgent:
                 action.observation = obs
                 self.context.add_step(action, obs)
                 print(f"[Tool] {action.action} completed in {time.time() - action.timestamp:.2f}s")
+                if action.action == "read_file":
+                    self._file_read_done = True
+                    # Promote any parked codeql HIGH into the active window now
+                    # that the agent has read the source.
+                    if (
+                        self._verification_mode == "flexible"
+                        and self._pending_high_observation
+                        and self._codeql_high_found_step < 0
+                    ):
+                        self._codeql_high_found_step  = self.context.steps_taken
+                        self._codeql_high_observation = self._pending_high_observation
+                        self._pending_high_observation = ""
+                        print(
+                            "[Agent] flexible mode — read_file done, "
+                            "verification window now open (2 steps)."
+                        )
 
                 if hyp:
                     self.context.add_hypothesis(hyp)
@@ -506,7 +557,7 @@ class KeryxAgent:
         """Return deduplicated rule names found in an AST/codeql observation.
 
         Parses patterns like ``[HIGH] SUBPROCESS_SHELL_TRUE @ line 5`` and
-        ``[MEDIUM] LLM_OUTPUT_SINK @ line 12``.  Order is preserved (first
+        ``[MEDIUM] UNSAFE_DESERIALIZATION @ line 12``.  Order is preserved (first
         occurrence wins), duplicates removed.
         """
         seen: dict[str, None] = {}
@@ -585,21 +636,39 @@ class KeryxAgent:
 
             else:  # "flexible"
                 # Give agent 2 steps to call injection_verifier itself.
+                # Window only starts after the agent has read the file — ensures
+                # the LLM sees source context before confirming.
                 if self._codeql_high_found_step < 0:
-                    self._codeql_high_found_step = self.context.steps_taken
-                    self._codeql_high_observation = action.observation[:800]
-                    print(
-                        "[Agent] flexible mode — codeql HIGH found. "
-                        "Agent has 2 steps to run injection_verifier."
-                    )
+                    if not self._file_read_done:
+                        # Park the observation; window will start once read_file fires.
+                        self._pending_high_observation = action.observation[:800]
+                        print(
+                            "[Agent] flexible mode — codeql HIGH found, "
+                            "waiting for read_file before starting verification window."
+                        )
+                    else:
+                        self._codeql_high_found_step = self.context.steps_taken
+                        self._codeql_high_observation = action.observation[:800]
+                        print(
+                            "[Agent] flexible mode — codeql HIGH found. "
+                            "Agent has 2 steps to run injection_verifier."
+                        )
 
         # flexible static fallback: window elapsed → confirm on AST alone
+        # Blocked if critique already declared the finding a false positive.
         if (
             self._verification_mode == "flexible"
             and self._codeql_unconfirmed
             and self._codeql_high_found_step >= 0
             and (self.context.steps_taken - self._codeql_high_found_step) >= 2
         ):
+            if self._codeql_high_rejected:
+                print("[Agent] Verification window elapsed — NOT confirming (critique rejected).")
+                self._codeql_unconfirmed       = False
+                self._codeql_high_found_step   = -100
+                self._codeql_high_observation  = ""
+                self._codeql_high_rejected     = False
+                return False
             print("[Agent] Verification window elapsed — confirming (AST-only).")
             self._codeql_unconfirmed = False
             _rules = self._extract_rules(self._codeql_high_observation)
@@ -618,9 +687,10 @@ class KeryxAgent:
 
         # dynamic confirm: injection_verifier returned VULN_CONFIRMED
         if dynamic_confirmed:
-            self._codeql_unconfirmed = False
-            self._codeql_high_found_step = -100
+            self._codeql_unconfirmed      = False
+            self._codeql_high_found_step  = -100
             self._codeql_high_observation = ""
+            self._codeql_high_rejected    = False
             print("[Agent] Dynamically confirmed via injection_verifier — stopping early.")
             _rules = self._extract_rules(action.observation)
             self.context.confirmed_vulns.append({
@@ -783,14 +853,21 @@ class KeryxAgent:
             f"    \"base_overrides\": {{\"file\": {self.context.target_path!r}}}}}\n"
             "- STRATEGY:\n"
             "  1. Run codeql_query on the full target file FIRST — returns all findings in one call.\n"
-            "  2. Use read_file only to inspect specific lines cited in codeql output.\n"
+            "  2. MANDATORY (flexible mode): call read_file on the lines around EVERY HIGH finding.\n"
+            "     Before confirming, explicitly answer in your 'thought':\n"
+            "       (a) Is this production code or a test fixture / mock / example?\n"
+            "           Signs of test code: file path contains 'test', 'mock', 'fixture', 'example',\n"
+            "           'sample', 'demo'; variable names like MOCK_*, FAKE_*, TEST_*; values like\n"
+            "           'CATABC...', 'dummy', 'placeholder', 'changeme', 'example_key'.\n"
+            "       (b) Is the vulnerable value actually reachable from untrusted input?\n"
+            "     If the finding is in test code OR the value is an obvious placeholder → do NOT confirm.\n"
             "  3. MANDATORY: if codeql found GIT_OPTION_INJECTION, SUBPROCESS_SHELL_TRUE, or\n"
             "     UNSANITIZED_SUBPROCESS_ARG — you MUST call injection_verifier before finishing.\n"
             "     Use the exact field and a relevant payload (e.g. '--upload-pack=test' for git flags,\n"
             "     '../../../etc/passwd' for path fields). Set expected_behavior to 'reject'.\n"
             "     Always include base_overrides with the target file path (see example above).\n"
-            "  4. Only use FINISH after injection_verifier has run on at least one HIGH finding.\n"
-            "  Do NOT call read_file multiple times before codeql_query.\n"
+            "  4. Only use FINISH after you have read the relevant code section.\n"
+            "  Do NOT confirm based on codeql output alone — always read the code first.\n"
             "- Always include a 'hypothesis' describing what vulnerability you suspect\n"
             "- Read DIFFERENT sections each step — do not re-read the same lines\n"
             "- When done investigating, use FINISH action\n"

@@ -35,7 +35,7 @@ RULE_SCORE_BONUS: dict[str, float] = {
     "OPEN_USER_PATH":              8.0,
     # Low priority / noise
     "REGEX_DOS":                   2.5,
-    "LLM_OUTPUT_SINK":             1.5,
+    "UNSAFE_DESERIALIZATION":             1.5,
 }
 
 
@@ -112,7 +112,7 @@ RULE_ROUTING_WEIGHT: dict[str, float] = {
     "SUBPROCESS_EXEC_STARRED":    1.1,
     "UNSANITIZED_SUBPROCESS_ARG": 1.0,
     "OPEN_USER_PATH":             0.9,
-    "LLM_OUTPUT_SINK":            0.20,
+    "UNSAFE_DESERIALIZATION":            0.20,
     "REGEX_DOS":                  0.25,
 }
 
