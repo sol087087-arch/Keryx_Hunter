@@ -281,66 +281,93 @@ All fuzzing and compilation runs inside a Docker container with AddressSanitizer
 ### Requirements
 
 - Python 3.11+
-- Docker
-- NVIDIA GPU (optional, for local models)
-- GDB, CodeQL CLI (optional)
+- An Anthropic API key (`ANTHROPIC_API_KEY`) — or use `--scripted` for offline testing
 
 ### Installation
 
 ```bash
 git clone https://github.com/keryxhunter/KeryxHunter
 cd KeryxHunter
-
-# Standard install (cloud API support)
 pip install -e .
-
-# With local model support (llama.cpp)
-pip install -e ".[local]"
-
-# Full install (all backends)
-pip install -e ".[full]"
 ```
 
-### Docker (recommended)
+### First Run (5 minutes)
 
 ```bash
-docker pull keryx/keryx:latest
+# Set your API key
+export ANTHROPIC_API_KEY=sk-ant-...
 
-docker run --gpus all \
-  -v /path/to/codebase:/target \
-  -v /path/to/models:/models \
-  keryx/keryx:latest hunt --target /target --mode airgapped
+# Scan a project — top 5 files, Haiku model, $0.30 budget
+keryx hunt --target ./my-project
+
+# More thorough: top 10 files, route top 3 to Opus
+keryx hunt --target ./my-project \
+  --top-n 10 --escalate-n 3 --escalate-model opus \
+  --budget 0.50 --output-html results/report.html
+
+# Air-gapped / CI — no API key needed
+keryx hunt --target ./my-project --scripted
 ```
 
-### First Run
+That's it. KeryxHunter will:
+1. **Phase 0** — AST-scan all `.py` files, score by rule severity + git history
+2. **Phase 1** — Hunt top-N files with the LLM agent (Haiku for most, Opus for top suspects)
+3. **Phase 2** — Print a ranked report with confirmed findings, cost breakdown, and fix recommendations
 
-```bash
-# 1. Add a local executor model
-keryx model add \
-  --name llama-8b \
-  --backend llama.cpp \
-  --path /models/llama-3-8b.gguf
+### All CLI options
 
-# 2. Add a local advisor model
-keryx model add \
-  --name llama-70b \
-  --backend llama.cpp \
-  --path /models/llama-3-70b.gguf \
-  --gpu-layers 45
-
-# 3. (Optional) Add a cloud advisor
-export ANTHROPIC_API_KEY=sk-...
-keryx model add --name claude-opus --provider anthropic
-
-# 4. Run analysis with advisor escalation
-keryx hunt \
-  --target /path/to/firefox \
-  --capability deep_reasoning \
-  --advisor cascade-advisor
-
-# 5. View results
-keryx report --format html --output report.html
 ```
+keryx hunt --target PATH          # required: directory to scan
+  --model haiku|sonnet|opus       # default model (default: haiku)
+  --escalate-model opus           # model for top files (default: opus)
+  --escalate-n N                  # how many top files go to escalate-model
+  --top-n N                       # total files to hunt (default: 5)
+  --budget USD                    # max spend (default: 0.50)
+  --mode strict|flexible|none     # verification strictness (default: strict)
+  --min-score N                   # min Phase 0 score to include (default: 12.0)
+  --no-blame                      # skip git enrichment (faster)
+  --no-cache                      # force full rescan
+  --output-json PATH              # write JSON report
+  --output-html PATH              # write HTML report
+  --output-sarif PATH             # write SARIF report (GitHub Security tab)
+  --scripted                      # offline mode, no API key needed
+  --fail-if-confirmed             # exit 1 if any vuln confirmed (CI)
+```
+
+---
+
+## Known Limitations
+
+These are honest limitations discovered via self-hunting KeryxHunter on its own codebase.
+
+### Verification coverage
+
+**Dynamic verification only works for files that match a registered tool name.**
+Files like `fuzzer.py`, `cloud_advisor.py`, or any file in an external project that doesn't correspond to a KeryxHunter-internal tool will fall back to fuzzer PoC verification (sandbox-based). This is still useful but less precise than injection-verifier testing.
+
+**`REGEX_DOS` reports `reachable` on Python 3.11+.**
+CPython 3.11+ includes catastrophic-backtracking protection that prevents the pattern from hanging. The finding is real (no allowlist check), but the sandbox completes in milliseconds rather than demonstrating a timeout. On Python ≤3.10 the same harness would return `triggered`.
+
+### Phase 0 scoring
+
+**`UNSAFE_DESERIALIZATION` has a high false-positive rate on typical Python code.**
+In self-hunt runs: 5–7 files flagged per run, 0 confirmed. The rule detects any LLM output flowing to a sink (print, return, eval), which is common and usually safe. Its score bonus is kept low (1.5) to reduce Opus slot waste, but it still surfaces in Phase 0.
+
+**`complexity_bonus` uses `line_count = 0` for cached files** until the cache is rebuilt with `--no-cache`. First run after updating KeryxHunter: add `--no-cache` once to warm the new cache.
+
+### Rule coverage
+
+KeryxHunter currently detects vulnerabilities in **Python only**.
+Multi-language support (JavaScript, Go, Rust) is on the roadmap but not yet implemented.
+
+The AST analyzer covers 15 rule classes (R1–R15). It does not yet detect:
+SQL injection, XXE, insecure deserialization via `jsonpickle`, path traversal via `zipfile`, or race conditions.
+
+### Budget and models
+
+The `--budget` flag is a soft cap checked between files — it does not interrupt a hunt mid-file. Actual spend may exceed the budget by one file's cost.
+
+Cloud models require `ANTHROPIC_API_KEY`. Local model support (`llama-cpp-python`) is implemented but requires manual installation of the `[local]` extras and a GGUF model file.
 
 ---
 

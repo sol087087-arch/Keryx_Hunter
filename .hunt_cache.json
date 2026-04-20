@@ -1,0 +1,425 @@
+{
+  "version": 1,
+  "timestamp": 1776591686.29697,
+  "commit": "c29db43ae9634df6772593cb3b9f35a6ed9e20ba",
+  "entries": {
+    "keryx/Debug_lazy.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1775973621.005224
+    },
+    "keryx/__init__.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776281425.0205314
+    },
+    "keryx/clean_invisible.py": {
+      "high_count": 1,
+      "medium_count": 0,
+      "rules": [
+        "REGEX_DOS"
+      ],
+      "mtime": 1776124571.9178336
+    },
+    "keryx/update_models_2026.py": {
+      "high_count": 1,
+      "medium_count": 0,
+      "rules": [
+        "REGEX_DOS"
+      ],
+      "mtime": 1776124571.9179723
+    },
+    "keryx/tools/Toolbox.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776233783.806855
+    },
+    "keryx/tools/__init__.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776124951.0821793
+    },
+    "keryx/tools/rag_search.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776124935.4275286
+    },
+    "keryx/tools/codeql.py": {
+      "high_count": 0,
+      "medium_count": 5,
+      "rules": [
+        "SUBPROCESS_EXEC_STARRED",
+        "LLM_OUTPUT_SINK"
+      ],
+      "mtime": 1776124875.3104296
+    },
+    "keryx/tools/fuzzer.py": {
+      "high_count": 1,
+      "medium_count": 3,
+      "rules": [
+        "SUBPROCESS_EXEC_STARRED",
+        "UNSANITIZED_SUBPROCESS_ARG",
+        "REGEX_DOS"
+      ],
+      "mtime": 1776124899.087284
+    },
+    "keryx/tools/Debug_hotspots.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1775973621.0081902
+    },
+    "keryx/tools/gdb.py": {
+      "high_count": 0,
+      "medium_count": 1,
+      "rules": [
+        "SUBPROCESS_EXEC_STARRED"
+      ],
+      "mtime": 1776124913.1385915
+    },
+    "keryx/tools/read_file.py": {
+      "high_count": 0,
+      "medium_count": 1,
+      "rules": [
+        "OPEN_USER_PATH"
+      ],
+      "mtime": 1776227877.4632905
+    },
+    "keryx/tools/git_blame.py": {
+      "high_count": 0,
+      "medium_count": 1,
+      "rules": [
+        "SUBPROCESS_EXEC_STARRED"
+      ],
+      "mtime": 1776474756.570347
+    },
+    "keryx/tools/injection_verifier.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776234394.313052
+    },
+    "keryx/fuzzing/harness.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776540352.6427166
+    },
+    "keryx/fuzzing/__init__.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776495306.3345816
+    },
+    "keryx/fuzzing/llm_harness.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776546207.485872
+    },
+    "keryx/fuzzing/sandbox.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776495331.0710504
+    },
+    "keryx/fuzzing/tool.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776495409.9910662
+    },
+    "keryx/core/_airgap.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776126583.0545387
+    },
+    "keryx/core/_constants.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776540329.686906
+    },
+    "keryx/core/_escalation.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776127903.2695627
+    },
+    "keryx/core/_loop_guards.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776402754.8732278
+    },
+    "keryx/core/Core init.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1775973621.0064096
+    },
+    "keryx/core/_checkpoint.py": {
+      "high_count": 0,
+      "medium_count": 3,
+      "rules": [
+        "OPEN_USER_PATH",
+        "LLM_OUTPUT_SINK"
+      ],
+      "mtime": 1776194202.1891522
+    },
+    "keryx/core/_swarm.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776148704.272276
+    },
+    "keryx/core/__init__.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1775977181.3647022
+    },
+    "keryx/core/sarif.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776540358.1954265
+    },
+    "keryx/core/_parser.py": {
+      "high_count": 0,
+      "medium_count": 1,
+      "rules": [
+        "LLM_OUTPUT_SINK"
+      ],
+      "mtime": 1776405024.4798388
+    },
+    "keryx/core/schemas.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776124742.9562352
+    },
+    "keryx/core/orchestrator.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776376312.6693347
+    },
+    "keryx/core/shared_context.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776474492.0607135
+    },
+    "keryx/core/agent.py": {
+      "high_count": 0,
+      "medium_count": 1,
+      "rules": [
+        "LLM_OUTPUT_SINK"
+      ],
+      "mtime": 1776542607.0208
+    },
+    "keryx/core/_budget.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776402763.385994
+    },
+    "keryx/core/hunt_config.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776281417.5426302
+    },
+    "keryx/core/router.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776376312.6695592
+    },
+    "keryx/core/rule_learner.py": {
+      "high_count": 1,
+      "medium_count": 0,
+      "rules": [
+        "REGEX_DOS"
+      ],
+      "mtime": 1776546275.5931804
+    },
+    "keryx/core/_resources.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776127908.0430553
+    },
+    "keryx/advisors/local_advisor.py": {
+      "high_count": 0,
+      "medium_count": 1,
+      "rules": [
+        "LLM_OUTPUT_SINK"
+      ],
+      "mtime": 1776124571.9194884
+    },
+    "keryx/advisors/__init__.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1775977181.364931
+    },
+    "keryx/advisors/shared_context.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776376312.6685526
+    },
+    "keryx/advisors/cloud_advisor.py": {
+      "high_count": 1,
+      "medium_count": 1,
+      "rules": [
+        "LLM_OUTPUT_SINK",
+        "REGEX_DOS"
+      ],
+      "mtime": 1776236911.5200021
+    },
+    "keryx/advisors/manager.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776212777.3414867
+    },
+    "keryx/advisors/base.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776237072.2575152
+    },
+    "keryx/advisors/cascade.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776215211.9009597
+    },
+    "keryx/models/swarm.py": {
+      "high_count": 0,
+      "medium_count": 1,
+      "rules": [
+        "LLM_OUTPUT_SINK"
+      ],
+      "mtime": 1776376312.6701527
+    },
+    "keryx/models/remote.py": {
+      "high_count": 0,
+      "medium_count": 1,
+      "rules": [
+        "LLM_OUTPUT_SINK"
+      ],
+      "mtime": 1776451018.5980246
+    },
+    "keryx/models/local.py": {
+      "high_count": 1,
+      "medium_count": 1,
+      "rules": [
+        "LLM_OUTPUT_SINK",
+        "TEMPLATE_INJECTION"
+      ],
+      "mtime": 1776124571.9183874
+    },
+    "keryx/models/interface.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776193369.5324104
+    },
+    "keryx/models/__init__.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1775977181.3648643
+    },
+    "keryx/models/local_mock.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776124571.9159768
+    },
+    "keryx/knowledge/graph.py": {
+      "high_count": 0,
+      "medium_count": 3,
+      "rules": [
+        "OPEN_USER_PATH",
+        "LLM_OUTPUT_SINK"
+      ],
+      "mtime": 1776124571.9205096
+    },
+    "keryx/knowledge/__init__.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1775977181.3649898
+    },
+    "keryx/knowledge/embeddings.py": {
+      "high_count": 0,
+      "medium_count": 5,
+      "rules": [
+        "OPEN_USER_PATH",
+        "LLM_OUTPUT_SINK"
+      ],
+      "mtime": 1776124933.0428114
+    },
+    "keryx/tools/ast_analyzer.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776575928.0929186
+    },
+    "keryx/fuzzing/poc.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776575401.1060753
+    },
+    "keryx/core/hunt_pipeline.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776577403.9143472
+    },
+    "keryx/core/scan_pipeline.py": {
+      "high_count": 0,
+      "medium_count": 1,
+      "rules": [
+        "LLM_OUTPUT_SINK"
+      ],
+      "mtime": 1776576798.9122317
+    },
+    "keryx/core/verification_pipeline.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776575419.3503404
+    },
+    "keryx/core/reporters.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776591217.940153
+    },
+    "keryx/core/hunt_models.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776591115.831982
+    },
+    "keryx/models/scripted.py": {
+      "high_count": 0,
+      "medium_count": 0,
+      "rules": [],
+      "mtime": 1776576364.6867855
+    }
+  }
+}

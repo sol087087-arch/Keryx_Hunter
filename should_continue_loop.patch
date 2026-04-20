@@ -1,0 +1,31 @@
+diff --git a/keryx/core/agent.py b/keryx/core/agent.py
+index abc1234..def5678 100644
+--- a/keryx/core/agent.py
++++ b/keryx/core/agent.py
+@@ -XXX,6 +XXX,15 @@ class KeryxAgent:
+         """Allow external assignment (e.g. test fixtures) via the same name."""
+         self._shared_context = value
+ 
++    def should_continue_loop(self) -> bool:
++        """Pure decision: should the ReAct loop continue? No side effects."""
++        if self._shared_context is None:
++            return False
++
++        ctx = self._shared_context
++        if self.budget and not self.budget.can_proceed(self.executor):
++            return False
++        if ctx.loop_detector.is_in_stupid_loop():
++            return False
++        return ctx.steps_taken < self.max_steps
++
+     # ------------------------------------------------------------------
+     # Public entry point
+     # ------------------------------------------------------------------
+@@ -YYY,7 +YYY,7 @@ class KeryxAgent:
+             return { ... airgap violation ... }
+ 
+-        while self.context.steps_taken < self.max_steps:
++        while self.should_continue_loop():
+ 
+             # ── Pre-step guard (budget + health) ─────────────────────────
+             precond = await self._precondition_check()

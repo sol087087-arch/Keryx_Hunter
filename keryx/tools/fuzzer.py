@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import platform
@@ -17,7 +18,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 # FIX 1: correct import path
 try:
@@ -25,7 +26,7 @@ try:
 except ImportError:
     SharedContext = Any  # type: ignore
 
-from .toolbox import BaseTool, ToolResult
+from .Toolbox import BaseTool, ToolResult
 
 logger = logging.getLogger("keryx.tools.fuzzer")
 
@@ -42,8 +43,8 @@ class FuzzerResult:
     crashes_found:     int
     unique_crashes:    int
     execution_time_ms: float
-    findings:          List[Dict[str, Any]] = field(default_factory=list)
-    crash_files:       List[str]            = field(default_factory=list)
+    findings:          list[dict[str, Any]] = field(default_factory=list)
+    crash_files:       list[str]            = field(default_factory=list)
     stdout:            str                  = ""
     stderr:            str                  = ""
     exit_code:         int                  = 0
@@ -53,7 +54,7 @@ class FuzzerResult:
 # ASan output parser
 # ---------------------------------------------------------------------------
 
-_ASAN_PATTERNS: Dict[str, str] = {
+_ASAN_PATTERNS: dict[str, str] = {
     "heap-use-after-free":      r"==\d+==ERROR: AddressSanitizer: heap-use-after-free",
     "heap-buffer-overflow":     r"==\d+==ERROR: AddressSanitizer: heap-buffer-overflow",
     "stack-buffer-overflow":    r"==\d+==ERROR: AddressSanitizer: stack-buffer-overflow",
@@ -65,7 +66,7 @@ _ASAN_PATTERNS: Dict[str, str] = {
 }
 
 
-def parse_asan_output(output: str) -> List[Dict[str, Any]]:
+def parse_asan_output(output: str) -> list[dict[str, Any]]:
     detected = next(
         (ct for ct, pat in _ASAN_PATTERNS.items() if re.search(pat, output)),
         None,
@@ -73,7 +74,7 @@ def parse_asan_output(output: str) -> List[Dict[str, Any]]:
     if not detected:
         return []
 
-    stack: List[str] = []
+    stack: list[str] = []
     in_stack = False
     for line in output.splitlines():
         if re.match(r"\s+#\d+ ", line):
@@ -138,11 +139,11 @@ class FuzzerTool(BaseTool):
 
     def __init__(
         self,
-        afl_path:         Optional[str] = None,
+        afl_path:         str | None = None,
         timeout_seconds:  float         = 120.0,
         max_output_chars: int           = 50_000,
         enable_scrubbing: bool          = True,
-        default_seed_dir: Optional[str] = None,
+        default_seed_dir: str | None = None,
     ):
         super().__init__()   # FIX 8: super sets _call_count etc — don't repeat
         self.afl_path         = afl_path or shutil.which("afl-fuzz") or "afl-fuzz"
@@ -168,7 +169,7 @@ class FuzzerTool(BaseTool):
 
     async def execute(
         self,
-        action_input: Dict[str, Any],
+        action_input: dict[str, Any],
         context:      Any = None,
     ) -> ToolResult:
         fuzzer_type = action_input.get("fuzzer_type", "afl")
@@ -195,7 +196,7 @@ class FuzzerTool(BaseTool):
             )
 
         start = time.time()
-        output_dir: Optional[str] = None
+        output_dir: str | None = None
 
         try:
             if fuzzer_type == "afl":
@@ -246,7 +247,7 @@ class FuzzerTool(BaseTool):
                 },
             )
 
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self._record_call(success=False, duration_ms=(time.time() - start) * 1000)
             logger.error(f"[FuzzerTool] Timed out after {self.timeout}s")
             return ToolResult(
@@ -263,10 +264,8 @@ class FuzzerTool(BaseTool):
             # FIX 5: clean up temp output dirs on success too
             if output_dir and output_dir.startswith(tempfile.gettempdir()):
                 import shutil as _sh
-                try:
+                with contextlib.suppress(Exception):
                     _sh.rmtree(output_dir, ignore_errors=True)
-                except Exception:
-                    pass
 
     # ------------------------------------------------------------------
     # AFL++
@@ -274,7 +273,7 @@ class FuzzerTool(BaseTool):
 
     async def _run_afl(
         self,
-        action_input: Dict[str, Any],
+        action_input: dict[str, Any],
         binary:       str,
     ) -> tuple[FuzzerResult, str]:
         """Returns (FuzzerResult, output_dir) so caller can clean up."""
@@ -324,7 +323,7 @@ class FuzzerTool(BaseTool):
         )
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=self.timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             _kill_pg(proc)
             raise
 
@@ -357,7 +356,7 @@ class FuzzerTool(BaseTool):
 
     async def _run_libfuzzer(
         self,
-        action_input: Dict[str, Any],
+        action_input: dict[str, Any],
         binary:       str,
     ) -> tuple[FuzzerResult, str]:
         """
@@ -388,18 +387,16 @@ class FuzzerTool(BaseTool):
             stderr=asyncio.subprocess.PIPE,
         )
 
-        timed_out = False
         try:
             stdout_b, stderr_b = await asyncio.wait_for(
                 proc.communicate(), timeout=self.timeout + 5.0  # slight grace over -max_total_time
             )
-        except asyncio.TimeoutError:
-            timed_out = True
+        except TimeoutError:
             try:
                 proc.terminate()
                 # FIX 4: read buffered output BEFORE wait, not after
                 stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=2.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 proc.kill()
                 stdout_b, stderr_b = await proc.communicate()
 
@@ -423,12 +420,12 @@ class FuzzerTool(BaseTool):
     # FIX 6: _process_crash_files — was called but never defined
     # ------------------------------------------------------------------
 
-    def _process_crash_files(self, crash_files: List[str]) -> List[Dict[str, Any]]:
+    def _process_crash_files(self, crash_files: list[str]) -> list[dict[str, Any]]:
         """
         Read crash artifacts and parse ASan output from each.
         Returns aggregated findings list.
         """
-        all_findings: List[Dict[str, Any]] = []
+        all_findings: list[dict[str, Any]] = []
         for path_str in crash_files[:20]:   # cap to avoid excessive I/O
             try:
                 content = Path(path_str).read_text(encoding="utf-8", errors="replace")
@@ -444,7 +441,7 @@ class FuzzerTool(BaseTool):
     # Helpers
     # ------------------------------------------------------------------
 
-    def get_preset_commands(self) -> Dict[str, str]:
+    def get_preset_commands(self) -> dict[str, str]:
         return {
             "quick_afl":      "fuzzer_type=afl, timeout=60s",
             "thorough_afl":   "fuzzer_type=afl, timeout=300s, extra_args=[-D]",
@@ -467,10 +464,8 @@ def _kill_pg(proc: asyncio.subprocess.Process) -> None:
     if _IS_WINDOWS:
         proc.kill()
         return
-    try:
+    with contextlib.suppress(ProcessLookupError):
         os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-    except ProcessLookupError:
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -478,7 +473,7 @@ def _kill_pg(proc: asyncio.subprocess.Process) -> None:
 # ---------------------------------------------------------------------------
 
 def create_fuzzer_tool(
-    afl_path:        Optional[str] = None,
+    afl_path:        str | None = None,
     timeout_seconds: float         = 120.0,
     **kwargs,
 ) -> FuzzerTool:

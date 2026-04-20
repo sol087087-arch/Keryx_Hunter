@@ -8,12 +8,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, replace
-from typing import Any, Dict, List, Optional
+from dataclasses import replace
+from typing import Any
 
-from ..embeddings import SimilarityHit, create_embedder
 from ..core.shared_context import SharedContext
-from .toolbox import ToolResult, BaseTool
+from ..embeddings import SimilarityHit, create_embedder
+from .Toolbox import BaseTool, ToolResult
 
 logger = logging.getLogger("keryx.tools.rag_search")
 
@@ -65,8 +65,8 @@ class RagSearchTool(BaseTool):
 
     async def execute(
         self,
-        action_input: Dict[str, Any],
-        context: Optional[SharedContext] = None,
+        action_input: dict[str, Any],
+        context: SharedContext | None = None,
     ) -> ToolResult:
         """
         Expected action_input keys:
@@ -144,10 +144,10 @@ class RagSearchTool(BaseTool):
     async def _semantic_context_hits(
         self,
         query: str,
-        context: Optional[SharedContext],
+        context: SharedContext | None,
         top_k: int,
         min_score: float,
-    ) -> List[SimilarityHit]:
+    ) -> list[SimilarityHit]:
         """
         Embed hypotheses and confirmed vulns from SharedContext and rank them
         against the query.  Uses the same embedder so scores are comparable.
@@ -159,7 +159,7 @@ class RagSearchTool(BaseTool):
         if context is None:
             return []
 
-        candidates: List[Dict[str, str]] = []
+        candidates: list[dict[str, str]] = []
 
         for hyp in getattr(context, "hypotheses", []):
             candidates.append({"text": hyp, "src": "hypothesis"})
@@ -183,7 +183,7 @@ class RagSearchTool(BaseTool):
         # Normalise query vector for true cosine similarity
         qvec = _normalize(query_result.vector)
 
-        hits: List[SimilarityHit] = []
+        hits: list[SimilarityHit] = []
 
         # BUG-FIX: iterate by index, never filter before zipping
         for i, res in enumerate(batch_results):
@@ -207,10 +207,10 @@ class RagSearchTool(BaseTool):
 
     @staticmethod
     def _merge_and_rank(
-        index_hits: List[SimilarityHit],
-        ctx_hits: List[SimilarityHit],
+        index_hits: list[SimilarityHit],
+        ctx_hits: list[SimilarityHit],
         top_k: int,
-    ) -> List[SimilarityHit]:
+    ) -> list[SimilarityHit]:
         """
         Merge index hits and context hits, deduplicate on first 100 chars,
         apply a small boost to context hits (they are immediately relevant).
@@ -219,7 +219,7 @@ class RagSearchTool(BaseTool):
         Mutating would corrupt objects that may be cached/shared by the embedder.
         """
         seen:   set           = set()
-        merged: List[SimilarityHit] = []
+        merged: list[SimilarityHit] = []
 
         # Context hits first (they get the boost)
         for h in ctx_hits:
@@ -243,7 +243,7 @@ class RagSearchTool(BaseTool):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _format_for_llm(hits: List[SimilarityHit], query: str) -> str:
+    def _format_for_llm(hits: list[SimilarityHit], query: str) -> str:
         if not hits:
             return f"No relevant results found for query: {query}"
 
@@ -262,11 +262,11 @@ class RagSearchTool(BaseTool):
 # Pure-Python math helpers (no numpy import at module level — stays optional)
 # ---------------------------------------------------------------------------
 
-def _dot(a: List[float], b: List[float]) -> float:
-    return sum(x * y for x, y in zip(a, b))
+def _dot(a: list[float], b: list[float]) -> float:
+    return sum(x * y for x, y in zip(a, b, strict=False))
 
 
-def _normalize(vec: List[float]) -> List[float]:
+def _normalize(vec: list[float]) -> list[float]:
     """L2-normalise so dot product equals cosine similarity."""
     norm = _dot(vec, vec) ** 0.5
     if norm == 0.0:
@@ -295,7 +295,7 @@ async def rag_search(
     top_k: int = 8,
     min_score: float = 0.65,
     embedder=None,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """One-shot search — returns the structured hits list, not a ToolResult."""
     tool   = create_rag_search_tool(embedder=embedder, top_k=top_k, min_score=min_score)
     result = await tool.execute({"query": query, "top_k": top_k, "min_score": min_score})

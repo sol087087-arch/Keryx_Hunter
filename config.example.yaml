@@ -1,0 +1,82 @@
+# config.example.yaml — KeryxHunter example configuration
+#
+# Copy this file and adjust to your environment.
+# Pass via: keryx hunt --target ./my-project (reads defaults below)
+# Or override per-run with CLI flags.
+
+# ---------------------------------------------------------------------------
+# Scan settings (Phase 0 — AST + git)
+# ---------------------------------------------------------------------------
+scan:
+  # Number of top-scored files to hunt with an LLM
+  top_n: 10
+
+  # Minimum Phase 0 score to include a file.
+  # Lower = more files, more noise. Higher = fewer files, faster runs.
+  # Rule-of-thumb: 12.0 filters pure-noise files; 20.0 focuses on high-risk only.
+  min_score: 12.0
+
+  # Maximum files to scan in Phase 0 (safety cap)
+  max_files: 300
+
+  # Git enrichment — adds blame recency + churn frequency to the score.
+  # Disable (no_blame: true) for repos without git history or for speed.
+  git_enrichment: true
+  blame_days: 90          # look back N days for commit history
+
+  # Incremental cache — skip unchanged files on re-runs.
+  # Cache is stored in .hunt_cache.json at the scan root.
+  cache: true
+
+# ---------------------------------------------------------------------------
+# Model routing (Phase 1 — LLM hunt)
+# ---------------------------------------------------------------------------
+models:
+  # Default model — used for most files (fast, cheap)
+  # Options: haiku, sonnet, opus (Anthropic) or any model ID
+  default: haiku
+
+  # Escalation model — used for top-priority files (slower, more thorough)
+  escalate: opus
+
+  # Number of top files to route to the escalation model (0 = disabled)
+  escalate_n: 3
+
+  # Shared budget cap in USD — hunt stops when this is reached
+  budget_usd: 0.50
+
+  # Verification mode:
+  #   strict   — require AST + dynamic verification (fuzz PoC or injection test)
+  #   flexible — AST confirmation alone is sufficient
+  #   none     — report all AST findings without LLM confirmation
+  mode: strict
+
+  # Automatically re-escalate inconclusive HIGH findings to the escalation model
+  escalate_inconclusive: true
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+output:
+  # Optional: write machine-readable reports after each run
+  # json:  null           # e.g. results/report.json
+  # html:  null           # e.g. results/report.html
+  # sarif: null           # e.g. results/report.sarif  (GitHub Security tab)
+
+  # Exit with code 1 if any vulnerability is confirmed (for CI pipelines)
+  fail_if_confirmed: false
+
+# ---------------------------------------------------------------------------
+# Phase 0 scoring weights (advanced — safe to leave as defaults)
+# ---------------------------------------------------------------------------
+# These control how Phase 0 ranks files. Higher = more likely to be hunted.
+# Rules not listed default to 0.0 bonus (Phase 0) or 1.0 multiplier (routing).
+#
+# RULE_SCORE_BONUS — additive bonus on top of HIGH×10 + MEDIUM×3 + git scores
+# scoring:
+#   SUBPROCESS_SHELL_TRUE: 28.0   # RCE — highest priority
+#   GIT_OPTION_INJECTION:  24.0
+#   OS_SHELL_INJECTION:    21.0
+#   UNSAFE_EVAL_EXEC:      19.0
+#   REGEX_DOS:              2.5   # noisy — kept low intentionally
+#   UNSAFE_DESERIALIZATION:        1.5   # high FP rate — kept low intentionally

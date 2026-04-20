@@ -11,10 +11,10 @@ import json
 import logging
 import time
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor   # FIX 8: Thread not Process
+from concurrent.futures import ThreadPoolExecutor  # FIX 8: Thread not Process
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 logger = logging.getLogger("keryx.embeddings")
 
@@ -41,7 +41,7 @@ except ImportError:
     faiss = None  # type: ignore
 
 try:
-    import numpy as np   # FIX 1: guarded import
+    import numpy as np  # FIX 1: guarded import
     _NUMPY_AVAILABLE = True
 except ImportError:
     np = None  # type: ignore
@@ -57,13 +57,13 @@ class _LRUCache:
         self._cache: OrderedDict = OrderedDict()
         self._maxsize = maxsize
 
-    def get(self, key: str) -> Optional[List[float]]:
+    def get(self, key: str) -> list[float] | None:
         if key not in self._cache:
             return None
         self._cache.move_to_end(key)
         return self._cache[key]
 
-    def put(self, key: str, value: List[float]) -> None:
+    def put(self, key: str, value: list[float]) -> None:
         if key in self._cache:
             self._cache.move_to_end(key)
         else:
@@ -104,10 +104,10 @@ class _EncodeCallable:
 @dataclass
 class EmbeddingResult:
     success:           bool
-    vector:            Optional[List[float]] = None
+    vector:            list[float] | None = None
     embedding_time_ms: float                 = 0.0
-    error:             Optional[str]         = None
-    data:              Dict[str, Any]        = field(default_factory=dict)
+    error:             str | None         = None
+    data:              dict[str, Any]        = field(default_factory=dict)
 
 
 @dataclass
@@ -115,7 +115,7 @@ class SimilarityHit:
     id:       str
     text:     str
     score:    float
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +134,7 @@ class LocalEmbedder:
     def __init__(
         self,
         model_name:    str           = "all-MiniLM-L6-v2",
-        cache_dir:     Optional[str] = None,
+        cache_dir:     str | None = None,
         device:        str           = "cpu",
         use_faiss:     bool          = True,
         batch_size:    int           = 32,
@@ -148,17 +148,17 @@ class LocalEmbedder:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         self._model:     Any           = None
-        self._encode_fn: Optional[_EncodeCallable] = None
+        self._encode_fn: _EncodeCallable | None = None
         self._dimension: int           = 384
         self._cache     = _LRUCache(maxsize=cache_maxsize)   # FIX 9
 
         self._index           = None
-        self._id_to_text:     Dict[str, str]  = {}
-        self._id_to_metadata: Dict[str, Dict] = {}
+        self._id_to_text:     dict[str, str]  = {}
+        self._id_to_metadata: dict[str, dict] = {}
 
         # numpy fallback storage
-        self._vectors: List[Any]  = []   # List[np.ndarray]
-        self._ids:     List[int]  = []
+        self._vectors: list[Any]  = []   # List[np.ndarray]
+        self._ids:     list[int]  = []
 
         # FIX 8: ThreadPoolExecutor — model lives in main process, thread shares it.
         # ProcessPoolExecutor would spawn child processes that need to reload the model.
@@ -201,7 +201,7 @@ class LocalEmbedder:
     def _get_cache_key(self, text: str) -> str:
         return hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
 
-    def _get_dummy_vector(self, text: str) -> List[float]:
+    def _get_dummy_vector(self, text: str) -> list[float]:
         """Deterministic hash-based vector — reproducible across runs."""
         h = hashlib.sha256(text.encode()).hexdigest()
         return [int(h[i % len(h)], 16) / 15.0 - 0.5 for i in range(self._dimension)]
@@ -255,7 +255,7 @@ class LocalEmbedder:
             logger.error(f"[LocalEmbedder] embed failed: {exc}")
             return EmbeddingResult(success=False, error=str(exc))
 
-    async def embed_batch(self, texts: List[str]) -> List[EmbeddingResult]:
+    async def embed_batch(self, texts: list[str]) -> list[EmbeddingResult]:
         """Embed multiple texts in one model call (much faster than loop)."""
         self._load_model()
         self._call_count += 1
@@ -268,9 +268,9 @@ class LocalEmbedder:
             ]
 
         # Check cache first — only encode cache misses
-        results:    List[Optional[EmbeddingResult]] = [None] * len(texts)
-        miss_idx:   List[int]  = []
-        miss_texts: List[str]  = []
+        results:    list[EmbeddingResult | None] = [None] * len(texts)
+        miss_idx:   list[int]  = []
+        miss_texts: list[str]  = []
 
         for i, text in enumerate(texts):
             cached = self._cache.get(self._get_cache_key(text))
@@ -303,7 +303,7 @@ class LocalEmbedder:
 
     async def add_batch_to_index(
         self,
-        items: List[Tuple[int, str, Optional[Dict]]],
+        items: list[tuple[int, str, dict | None]],
     ) -> int:
         """
         Add items to FAISS or numpy fallback index.
@@ -318,8 +318,8 @@ class LocalEmbedder:
 
         embed_results = await self.embed_batch(texts)
 
-        valid_vecs: List[Any] = []
-        valid_ids:  List[int] = []
+        valid_vecs: list[Any] = []
+        valid_ids:  list[int] = []
 
         for i, res in enumerate(embed_results):
             if res.success and res.vector is not None and _NUMPY_AVAILABLE:
@@ -345,7 +345,7 @@ class LocalEmbedder:
         logger.info(f"[LocalEmbedder] Batch indexed {len(valid_vecs)}/{len(items)} items")
         return len(valid_vecs)
 
-    async def similarity_search(self, query: str, top_k: int = 5) -> List[SimilarityHit]:
+    async def similarity_search(self, query: str, top_k: int = 5) -> list[SimilarityHit]:
         result = await self.embed(query)
         if not result.success or result.vector is None or not _NUMPY_AVAILABLE:
             return []
@@ -358,7 +358,7 @@ class LocalEmbedder:
             k = min(top_k, self._index.ntotal)
             scores, indices = self._index.search(qvec, k)
             hits = []
-            for score, idx in zip(scores[0], indices[0]):
+            for score, idx in zip(scores[0], indices[0], strict=False):
                 if idx >= 0:
                     tid = str(idx)
                     hits.append(SimilarityHit(
@@ -446,7 +446,7 @@ class LocalEmbedder:
     # Metrics and lifecycle
     # ------------------------------------------------------------------
 
-    def get_metrics(self) -> Dict[str, Any]:
+    def get_metrics(self) -> dict[str, Any]:
         return {
             "name":          "local_embeddings",
             "model":         self.model_name,

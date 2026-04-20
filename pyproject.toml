@@ -133,6 +133,44 @@ disallow_untyped_defs   = true
 disallow_any_generics   = true
 
 # ---------------------------------------------------------------------------
+# Coverage
+# Omit files that require optional heavy dependencies (llama-cpp, docker,
+# cloud APIs, FAISS, etc.) and legacy / debug-only modules.
+# These cannot be covered without the full optional [local], [cloud], [sandbox]
+# install targets, so they must be excluded for CI with only core deps.
+# ---------------------------------------------------------------------------
+
+[tool.coverage.run]
+omit = [
+    # Optional-dependency model backends
+    # local.py and remote.py require llama-cpp-python / anthropic / openai.
+    # swarm.py only uses stdlib + ModelInterface — importable, measured.
+    "keryx/models/local.py",
+    "keryx/models/remote.py",
+    # Advisor backends — require functional local/cloud model backends
+    # (llama-cpp-python, anthropic, openai) which are optional dependencies.
+    # Cannot be covered under CI with only core deps installed.
+    "keryx/advisors/local_advisor.py",
+    "keryx/advisors/cloud_advisor.py",
+    # Optional-dependency tools
+    "keryx/tools/codeql.py",
+    "keryx/tools/fuzzer.py",
+    "keryx/tools/gdb.py",
+    "keryx/tools/rag_search.py",
+    # Optional-dependency knowledge / sandbox
+    "keryx/knowledge/embeddings.py",
+    "keryx/knowledge/graph.py",
+    "keryx/sandbox/container.py",
+    # Legacy / dead code (files deleted; entries kept as no-ops for safety)
+    "keryx/advisors/shared_context.py",
+    # Developer scripts and debug utilities
+    "keryx/Debug_lazy.py",
+    "keryx/clean_invisible.py",
+    "keryx/update_models_2026.py",
+    "keryx/tools/Debug_hotspots.py",
+]
+
+# ---------------------------------------------------------------------------
 # Pytest
 # ---------------------------------------------------------------------------
 

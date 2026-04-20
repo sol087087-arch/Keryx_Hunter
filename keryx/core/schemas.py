@@ -9,17 +9,16 @@ Do NOT add ToolResult here — it lives in keryx.tools.toolbox.
 
 from __future__ import annotations
 
-from enum import Enum
-from typing import Annotated, Literal, Optional
+from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
-
 
 # ---------------------------------------------------------------------------
 # Shared enums
 # ---------------------------------------------------------------------------
 
-class RiskLevel(str, Enum):
+class RiskLevel(StrEnum):
     CRITICAL = "CRITICAL"
     HIGH     = "HIGH"
     MEDIUM   = "MEDIUM"
@@ -34,20 +33,20 @@ class GitBlameInput(BaseModel):
     """Validated input for git operations."""
 
     command:     Literal["blame", "log", "hotspots"]
-    file:        Optional[str]       = None
-    line:        Optional[int]       = Field(None, ge=1)
+    file:        str | None       = None
+    line:        int | None       = Field(None, ge=1)
     n:           int                 = Field(10, ge=1, le=1000)
-    path:        Optional[str]       = None
-    author:      Optional[str]       = None
-    grep:        Optional[str]       = None
-    since:       Optional[str]       = None
-    extensions:  Optional[list[str]] = None
+    path:        str | None       = None
+    author:      str | None       = None
+    grep:        str | None       = None
+    since:       str | None       = None
+    extensions:  list[str] | None = None
     min_changes: int                 = Field(2, ge=1)
 
     # FIX: @model_validator(mode="after") for cross-field validation.
     # @field_validator cannot reliably see sibling fields due to evaluation order.
     @model_validator(mode="after")
-    def file_required_for_blame(self) -> "GitBlameInput":
+    def file_required_for_blame(self) -> GitBlameInput:
         if self.command == "blame" and not self.file:
             raise ValueError("'file' is required when command='blame'")
         return self

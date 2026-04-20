@@ -1,0 +1,10 @@
+SESSION_REPORT.md
+NEXT_SESSION_PLAN.md
+**/*.bak
+**/*.pyc.env
+.coverage
+.keryx_checkpoints/
+hunt_result.json
+__pycache__/
+*.pyc
+.pytest_cache/

@@ -13,7 +13,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any
 
 try:
     from .core.shared_context import SharedContext
@@ -76,10 +76,10 @@ class GraphNode:
     id:         str
     type:       str    # file | function | hypothesis | crash | evidence
     label:      str
-    file:       Optional[str]        = None
-    line:       Optional[int]        = None
+    file:       str | None        = None
+    line:       int | None        = None
     risk_score: float                = 0.0
-    metadata:   Dict[str, Any]       = field(default_factory=dict)
+    metadata:   dict[str, Any]       = field(default_factory=dict)
 
 
 @dataclass
@@ -88,7 +88,7 @@ class GraphEdge:
     target:   str
     type:     str    # contains | calls | dataflow | hypothesis_link | crash_link
     weight:   float              = 1.0
-    metadata: Dict[str, Any]    = field(default_factory=dict)
+    metadata: dict[str, Any]    = field(default_factory=dict)
 
 
 @dataclass
@@ -96,10 +96,10 @@ class GraphAnalysisResult:
     success:          bool
     nodes:            int                   = 0
     edges:            int                   = 0
-    top_risky:        List[str]             = field(default_factory=list)
-    attack_paths:     List[List[str]]       = field(default_factory=list)
+    top_risky:        list[str]             = field(default_factory=list)
+    attack_paths:     list[list[str]]       = field(default_factory=list)
     execution_time_ms: float               = 0.0
-    data:             Dict[str, Any]        = field(default_factory=dict)
+    data:             dict[str, Any]        = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +110,7 @@ class GraphAnalysisResult:
 class CodeParser:
 
     @staticmethod
-    def extract_functions_cpp(content: str, file_path: str) -> List[Dict[str, Any]]:
+    def extract_functions_cpp(content: str, file_path: str) -> list[dict[str, Any]]:
         """Extract function definitions from C/C++ — excludes control flow keywords."""
         functions = []
         # Match: optional_return_type function_name(...)
@@ -135,7 +135,7 @@ class CodeParser:
         return functions
 
     @staticmethod
-    def extract_functions_js(content: str, file_path: str) -> List[Dict[str, Any]]:
+    def extract_functions_js(content: str, file_path: str) -> list[dict[str, Any]]:
         """Extract function definitions from JavaScript/TypeScript."""
         functions = []
         patterns = [
@@ -181,16 +181,16 @@ class VulnerabilityGraph:
 
     def __init__(self, enable_networkx: bool = True) -> None:
         self.enable_networkx = enable_networkx and _NETWORKX_AVAILABLE
-        self.nodes:      Dict[str, GraphNode] = {}
-        self.edges:      Dict[str, GraphEdge] = {}
-        self.hypotheses: Dict[str, Dict]      = {}
+        self.nodes:      dict[str, GraphNode] = {}
+        self.edges:      dict[str, GraphEdge] = {}
+        self.hypotheses: dict[str, dict]      = {}
         self._call_count = 0
         self._parser     = CodeParser()
 
         self._nx_graph = nx.DiGraph() if (self.enable_networkx and nx is not None) else None
 
         # FIX 7: adjacency list for O(1) edge lookup in BFS (no networkx dependency)
-        self._adj: Dict[str, List[str]] = {}   # source_id → [target_id, ...]
+        self._adj: dict[str, list[str]] = {}   # source_id → [target_id, ...]
 
         logger.info(f"[VulnerabilityGraph] Initialized | networkx={self.enable_networkx}")
 
@@ -230,11 +230,11 @@ class VulnerabilityGraph:
             )
 
     # FIX 1: define get_edges_from — was called in _bfs_find_paths but missing
-    def get_edges_from(self, node_id: str) -> List[GraphEdge]:
+    def get_edges_from(self, node_id: str) -> list[GraphEdge]:
         """Return all outgoing edges from a node."""
         return [e for e in self.edges.values() if e.source == node_id]
 
-    def get_neighbors(self, node_id: str) -> List[str]:
+    def get_neighbors(self, node_id: str) -> list[str]:
         """O(1) neighbor lookup via adjacency list."""
         return self._adj.get(node_id, [])
 
@@ -318,7 +318,7 @@ class VulnerabilityGraph:
     # Hypothesis and crash injection
     # ------------------------------------------------------------------
 
-    def add_hypothesis(self, hyp_id: str, nodes: List[str], risk: float = 0.8) -> None:
+    def add_hypothesis(self, hyp_id: str, nodes: list[str], risk: float = 0.8) -> None:
         """Inject hypothesis as PageRank seed — boosts connected node scores."""
         self.hypotheses[hyp_id] = {"nodes": nodes, "base_risk": risk}
         self.add_node(GraphNode(
@@ -338,8 +338,8 @@ class VulnerabilityGraph:
     def add_crash(
         self,
         crash_id:          str,
-        crash_info:        Dict[str, Any],
-        related_functions: List[str],
+        crash_info:        dict[str, Any],
+        related_functions: list[str],
     ) -> None:
         self.add_node(GraphNode(
             id=crash_id, type="crash",
@@ -365,7 +365,7 @@ class VulnerabilityGraph:
     # Ranking and path finding
     # ------------------------------------------------------------------
 
-    def rank_nodes_by_risk(self, top_n: int = 10) -> List[Tuple[str, float]]:
+    def rank_nodes_by_risk(self, top_n: int = 10) -> list[tuple[str, float]]:
         """Personalized PageRank with hypothesis risk as seeds, BFS fallback."""
         if self.enable_networkx and self._nx_graph is not None and len(self.nodes) > 1:
             try:
@@ -388,7 +388,7 @@ class VulnerabilityGraph:
         source_node: str,
         target_node: str,
         max_paths:   int = 5,
-    ) -> List[List[str]]:
+    ) -> list[list[str]]:
         if source_node not in self.nodes or target_node not in self.nodes:
             return []
         if self.enable_networkx and self._nx_graph is not None:
@@ -396,15 +396,15 @@ class VulnerabilityGraph:
                 return list(nx.all_shortest_paths(
                     self._nx_graph, source_node, target_node
                 ))[:max_paths]
-            except (Exception,):
+            except Exception:
                 pass
         return self._bfs_find_paths(source_node, target_node, max_paths)
 
     def _bfs_find_paths(
         self, source: str, target: str, max_paths: int
-    ) -> List[List[str]]:
+    ) -> list[list[str]]:
         """Pure-Python BFS using adjacency list for air-gapped mode."""
-        paths: List[List[str]] = []
+        paths: list[list[str]] = []
         queue: deque = deque([(source, [source])])
 
         while queue and len(paths) < max_paths:
@@ -421,7 +421,7 @@ class VulnerabilityGraph:
 
     def find_high_risk_paths(
         self, min_risk: float = 0.7, max_length: int = 5
-    ) -> List[List[str]]:
+    ) -> list[list[str]]:
         """
         Find paths where all nodes are high-risk.
         FIX 2: limit source+target pairs to avoid O(N²) explosion.
@@ -431,7 +431,7 @@ class VulnerabilityGraph:
             if n.risk_score >= min_risk
         ][:50]   # hard cap on candidates
 
-        paths: List[List[str]] = []
+        paths: list[list[str]] = []
         seen: set = set()
 
         for i, source in enumerate(high_risk):
@@ -450,7 +450,7 @@ class VulnerabilityGraph:
     # FIX 8: _json_safe applied to metadata before dump
     # ------------------------------------------------------------------
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "version": 1,
             "nodes": {
@@ -554,7 +554,7 @@ class VulnerabilityGraph:
     # Metrics
     # ------------------------------------------------------------------
 
-    def get_metrics(self) -> Dict[str, Any]:
+    def get_metrics(self) -> dict[str, Any]:
         return {
             "nodes":            len(self.nodes),
             "edges":            len(self.edges),
@@ -563,8 +563,8 @@ class VulnerabilityGraph:
             "node_types":       self._count_node_types(),
         }
 
-    def _count_node_types(self) -> Dict[str, int]:
-        counts: Dict[str, int] = {}
+    def _count_node_types(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
         for n in self.nodes.values():
             counts[n.type] = counts.get(n.type, 0) + 1
         return counts
@@ -588,7 +588,7 @@ def create_vulnerability_graph(enable_networkx: bool = True) -> VulnerabilityGra
 
 async def build_graph_from_target(
     target_path: str,
-    context:     Optional[Any] = None,
+    context:     Any | None = None,
 ) -> GraphAnalysisResult:
     """
     Async-safe graph build — offloads blocking I/O to thread pool.
@@ -621,4 +621,4 @@ async def build_graph_from_target(
         )
 
     return result
-  
+
